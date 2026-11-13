@@ -1,0 +1,743 @@
+'use strict';
+/* Prohlídky mostů – PWA pro sběr fotodokumentace a závad v terénu.
+   Data zůstávají v zařízení (IndexedDB), ven jen přes export ZIP. */
+const APP_VERSION = '0.1.0';
+const MAXPX = 2048;          // delší strana zmenšené fotky [px]
+const TARGET = 550 * 1024;   // cílová velikost JPEG [B]
+
+/* ---------- databáze ---------- */
+let dbp;
+function db() {
+  if (!dbp) dbp = new Promise((res, rej) => {
+    const r = indexedDB.open('prohlidky', 1);
+    r.onupgradeneeded = () => {
+      const d = r.result;
+      d.createObjectStore('bridges', { keyPath: 'id' });
+      d.createObjectStore('insp', { keyPath: 'id' });
+      d.createObjectStore('photos', { keyPath: 'id' }).createIndex('insp', 'inspId');
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+  return dbp;
+}
+async function tx(store, mode, fn) {
+  const d = await db();
+  return new Promise((res, rej) => {
+    const t = d.transaction(store, mode);
+    let out;
+    const r = fn(t.objectStore(store));
+    if (r) r.onsuccess = () => { out = r.result; };
+    t.oncomplete = () => res(out);
+    t.onerror = () => rej(t.error);
+    t.onabort = () => rej(t.error);
+  });
+}
+const put = (st, o) => tx(st, 'readwrite', s => s.put(o));
+const get = (st, id) => tx(st, 'readonly', s => s.get(id));
+const all = st => tx(st, 'readonly', s => s.getAll());
+const del = (st, id) => tx(st, 'readwrite', s => s.delete(id));
+const photosOf = inspId => tx('photos', 'readonly', s => s.index('insp').getAll(inspId));
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+
+/* ---------- pomocné ---------- */
+const $ = s => document.querySelector(s);
+const app = $('#app');
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmtDate = d => { d = new Date(d); return `${d.getDate()}. ${d.getMonth() + 1}. ${d.getFullYear()}`; };
+const fmtTime = d => { d = new Date(d); return `${d.getHours()}:${String(d.getMinutes()).padStart(2, '0')}`; };
+const num = (x, n) => (x == null || isNaN(x)) ? '–' : Number(x).toFixed(n).replace('.', ',');
+const isoDay = d => { d = new Date(d); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+function slug(s) {
+  return String(s).normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 70);
+}
+let toastT;
+function toast(msg, ms = 2500) {
+  const t = $('#toast'); t.textContent = msg; t.hidden = false;
+  clearTimeout(toastT); toastT = setTimeout(() => { t.hidden = true; }, ms);
+}
+let urls = [];
+function blobUrl(b) { const u = URL.createObjectURL(b); urls.push(u); return u; }
+function setTitle(t, back) {
+  $('#title').textContent = t;
+  const b = $('#nav-back');
+  b.style.visibility = back ? 'visible' : 'hidden';
+  b.onclick = () => { location.hash = back; };
+}
+
+/* ---------- číselníky ---------- */
+// Kódy částí mostu podle exportů HPM z BMS (vzorové prohlídky ve složce BMS). Seznam není úplný.
+const CODES = [
+  ['1.1', 'Základy mostních podpěr a křídel'], ['1.2', 'Mostní podpěry křídla a čelní zdi'], ['1.2.2', 'Pilíř'],
+  ['1.2.4', 'Křídlo'], ['1.3.1', 'Zemní těleso'], ['2.1', 'Nosná konstrukce'], ['2.2', 'Ložiska, klouby'],
+  ['2.3', 'Mostní závěry'], ['2.4', 'Čelní zdi a přesypávka'], ['3.1', 'Vozovka'], ['3.2', 'Chodníky'],
+  ['3.3', 'Římsy, obrubníky, zálivky'], ['3.3.1', 'Římsa'], ['3.5', 'Izolační systém NK'],
+  ['4.1', 'Svodidla/Zábradelní svodidla'], ['4.2', 'Zábradlí'], ['4.3', 'Dopravní značení, označení objektu'],
+  ['4.6', 'Území pod mostem a přístup. cesty'], ['4.7', 'Cizí zařízení'], ['4.8', 'Odvodnění'], ['5', 'Další části'],
+];
+const codeName = c => (CODES.find(x => x[0] === c) || [c, ''])[1];
+const DRUHY = { bezna: 'Běžná', podjezd: 'Podjezdu', hlavni: 'Hlavní / první hlavní', mimoradna: 'Technická / mimořádná' };
+
+/* Kontrolní seznam fotodokumentace – ČSN 73 6221, tab. 4 (doporučený rozsah). */
+const ALL = ['bezna', 'podjezd', 'hlavni', 'mimoradna'];
+const GROUPS = [ // [prefix klíče, název skupiny, druhy prohlídek, pořadí ve zprávě]
+  ['na', 'Prostorové uspořádání na mostě', ['bezna', 'hlavni', 'mimoradna']],
+  ['bok', 'Boční pohledy na most', ALL],
+  ['pod', 'Prostorové uspořádání pod mostem', ALL],
+  ['sup', 'Pohledy na jednotlivé podpěry', ALL],
+  ['kr', 'Pohledy na křídla krajních opěr', ALL],
+  ['nk', 'Podhled NK v jednotlivých polích', ALL],
+  ['loz', 'Ložiska a klouby', ['hlavni', 'mimoradna']],
+  ['mz', 'Mostní závěry (pohled shora)', ['bezna', 'hlavni', 'mimoradna']],
+];
+function supports(br) {
+  const n = Math.max(1, br.poli | 0), s = [];
+  for (let i = 1; i <= n + 1; i++) s.push(i === 1 || i === n + 1 ? 'OP' + i : 'P' + i);
+  return s;
+}
+function checklist(br, druh) {
+  const n = Math.max(1, br.poli | 0), sup = supports(br), ends = [sup[0], sup[sup.length - 1]];
+  const it = [];
+  const add = (g, key, cap, dir) => { if (GROUPS.find(x => x[0] === g)[2].includes(druh)) it.push({ g, key, cap, dir }); };
+  add('na', 'na-po', 'Pohled na most po směru staničení.');
+  add('na', 'na-proti', 'Pohled na most proti směru staničení.');
+  add('bok', 'bok-L', 'Pohled na most zleva ve směru staničení.');
+  add('bok', 'bok-P', 'Pohled na most zprava ve směru staničení.');
+  add('pod', 'pod', 'Pohled pod most.', true);
+  sup.forEach(s => add('sup', 'sup-' + s, `Pohled na ${s}.`, true));
+  ends.forEach(s => add('kr', 'kr-' + s, `Pohled na křídla ${s}.`, true));
+  for (let i = 1; i <= n; i++) add('nk', 'nk-' + i, n === 1 ? 'Pohled na podhled NK.' : `Pohled na podhled NK v poli ${i}.`);
+  sup.forEach(s => add('loz', 'loz-' + s, `Pohled na ložiska na ${s}.`));
+  ends.forEach(s => add('mz', 'mz-' + s, `Pohled na mostní závěr na ${s}.`));
+  return it;
+}
+const groupIdx = key => { const g = String(key || '').split('-')[0]; const i = GROUPS.findIndex(x => x[0] === g); return i >= 0 ? i : key === 'zavada' ? 90 : 99; };
+
+/* Směr pohledu vůči staničení: heading = azimut osy kamery, az = azimut směru staničení. */
+function dirWord(heading, az) {
+  if (heading == null || az == null || az === '') return '';
+  const r = ((heading - az) % 360 + 360) % 360;
+  if (r < 45 || r >= 315) return 've směru staničení';
+  if (r < 135) return 'zleva';      // kamera míří doprava → fotograf stojí vlevo
+  if (r < 225) return 'proti směru staničení';
+  return 'zprava';
+}
+function defaultCaption(item, dir) {
+  if (!item) return '';
+  if (item.dir && dir) return item.cap.replace(/\.$/, '') + ' ' + dir + '.';
+  return item.cap;
+}
+
+/* Souřadnice: WGS84 desetinně nebo DMS. */
+function parseCoords(s) {
+  s = String(s || '').trim();
+  if (!s) return null;
+  const dms = [...s.matchAll(/(\d+(?:[.,]\d+)?)\s*°\s*(?:(\d+(?:[.,]\d+)?)\s*['′]\s*)?(?:(\d+(?:[.,]\d+)?)\s*["″]\s*)?([NSEWsvjz])?/gi)];
+  let v;
+  if (dms.length === 2) {
+    v = dms.map(m => {
+      let x = parseFloat(m[1].replace(',', '.')) + (m[2] ? parseFloat(m[2].replace(',', '.')) / 60 : 0) + (m[3] ? parseFloat(m[3].replace(',', '.')) / 3600 : 0);
+      if (/[SWjz]/i.test(m[4] || '')) x = -x;
+      return x;
+    });
+  } else {
+    const nums = s.replace(/(\d),(\d)/g, '$1.$2').match(/-?\d+(?:\.\d+)?/g);
+    if (!nums || nums.length !== 2) return null;
+    v = nums.map(Number);
+  }
+  if (Math.abs(v[0]) > 1000 || Math.abs(v[1]) > 1000) return { err: 'Vypadá to na S-JTSK – zatím podporuji jen WGS84 (např. 50.1234, 14.5678).' };
+  const lat = Math.max(v[0], v[1]), lon = Math.min(v[0], v[1]); // v ČR je šířka (48–51) větší než délka (12–19)
+  return { lat, lon };
+}
+function distM(a, b, c, d) {
+  const R = 6371000, r = Math.PI / 180;
+  const x = Math.sin((c - a) * r / 2) ** 2 + Math.cos(a * r) * Math.cos(c * r) * Math.sin((d - b) * r / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(x));
+}
+
+/* ---------- senzory: GPS + kompas ---------- */
+const S = { on: false, heading: null, lat: null, lon: null, acc: null, t: 0 };
+function ensureSensors() {
+  if (S.on) return;
+  S.on = true;
+  const listen = () => {
+    window.addEventListener('deviceorientation', e => {
+      if (e.webkitCompassHeading != null) S.heading = e.webkitCompassHeading;       // iOS
+      else if (e.absolute && e.alpha != null) S.heading = (360 - e.alpha) % 360;
+      hud();
+    }, true);
+  };
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+      DeviceOrientationEvent.requestPermission().then(r => { if (r === 'granted') listen(); else toast('Kompas nepovolen'); }).catch(() => toast('Kompas nepovolen'));
+    } else listen();
+  } catch (e) { /* bez kompasu */ }
+  if (navigator.geolocation) {
+    navigator.geolocation.watchPosition(p => {
+      S.lat = p.coords.latitude; S.lon = p.coords.longitude; S.acc = p.coords.accuracy; S.t = Date.now(); hud();
+    }, e => toast('GPS: ' + e.message), { enableHighAccuracy: true, maximumAge: 5000, timeout: 30000 });
+  }
+}
+function snap() {
+  return {
+    ts: Date.now(), heading: S.heading,
+    lat: S.lat, lon: S.lon, acc: S.acc, gpsAge: S.t ? Math.round((Date.now() - S.t) / 1000) : null,
+  };
+}
+let hudCtx = null; // {az}
+function hud() {
+  const h = document.getElementById('hud-sens');
+  if (!h) return;
+  const d = hudCtx ? dirWord(S.heading, hudCtx.az) : '';
+  h.textContent = `${S.heading == null ? 'kompas –' : 'az ' + Math.round(S.heading) + '°'}${d ? ' · ' + d : ''} · ${S.acc == null ? 'GPS –' : 'GPS ±' + Math.round(S.acc) + ' m'}`;
+}
+
+/* ---------- zpracování fotky ---------- */
+async function processImage(src, date) {
+  const bmp = await createImageBitmap(src);
+  const s = Math.min(1, MAXPX / Math.max(bmp.width, bmp.height));
+  const w = Math.round(bmp.width * s), h = Math.round(bmp.height * s);
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  g.drawImage(bmp, 0, 0, w, h);
+  if (bmp.close) bmp.close();
+  // datum pořízení do pravého dolního rohu (ČSN 73 6221, 9.1.8)
+  const fs = Math.round(Math.max(w, h) * 0.028), txt = fmtDate(date);
+  g.font = `bold ${fs}px -apple-system, Helvetica, Arial, sans-serif`;
+  g.textAlign = 'right'; g.textBaseline = 'bottom';
+  g.lineWidth = Math.max(2, fs * 0.16); g.strokeStyle = '#000'; g.lineJoin = 'round';
+  g.strokeText(txt, w - fs * 0.6, h - fs * 0.45);
+  g.fillStyle = '#ffd400'; g.fillText(txt, w - fs * 0.6, h - fs * 0.45);
+  let q = 0.86, b;
+  do { b = await new Promise(r => c.toBlob(r, 'image/jpeg', q)); q -= 0.06; } while (b.size > TARGET && q > 0.45);
+  return b;
+}
+
+/* ---------- ZIP (bez komprese, bez knihoven) ---------- */
+const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(u) { let c = 0xFFFFFFFF; for (let i = 0; i < u.length; i++) c = CRC[(c ^ u[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+async function makeZip(files) {
+  const enc = new TextEncoder(), parts = [], central = [], now = new Date();
+  const dt = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+  const dd = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+  let off = 0;
+  for (const f of files) {
+    const data = typeof f.data === 'string' ? enc.encode(f.data) : new Uint8Array(await f.data.arrayBuffer());
+    const nm = enc.encode(f.name), crc = crc32(data);
+    const l = new DataView(new ArrayBuffer(30));
+    l.setUint32(0, 0x04034b50, true); l.setUint16(4, 20, true); l.setUint16(6, 0x0800, true);
+    l.setUint16(10, dt, true); l.setUint16(12, dd, true); l.setUint32(14, crc, true);
+    l.setUint32(18, data.length, true); l.setUint32(22, data.length, true); l.setUint16(26, nm.length, true);
+    parts.push(l.buffer, nm, data);
+    const c = new DataView(new ArrayBuffer(46));
+    c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true);
+    c.setUint16(12, dt, true); c.setUint16(14, dd, true); c.setUint32(16, crc, true);
+    c.setUint32(20, data.length, true); c.setUint32(24, data.length, true); c.setUint16(28, nm.length, true);
+    c.setUint32(42, off, true);
+    central.push(c.buffer, nm);
+    off += 30 + nm.length + data.length;
+  }
+  const size = central.reduce((a, b) => a + b.byteLength, 0);
+  const e = new DataView(new ArrayBuffer(22));
+  e.setUint32(0, 0x06054b50, true); e.setUint16(8, files.length, true); e.setUint16(10, files.length, true);
+  e.setUint32(12, size, true); e.setUint32(16, off, true);
+  return new Blob([...parts, ...central, e.buffer], { type: 'application/zip' });
+}
+async function saveFile(blob, name) {
+  const file = new File([blob], name, { type: blob.type });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file] }); return true; }
+    catch (e) { if (e.name === 'AbortError') return false; }
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 10000);
+  return true;
+}
+
+/* ---------- router ---------- */
+let stream = null, recorder = null;
+function cleanup() {
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (recorder && recorder.state === 'recording') recorder.stop();
+  recorder = null; hudCtx = null;
+  urls.forEach(u => URL.revokeObjectURL(u)); urls = [];
+}
+async function route() {
+  cleanup();
+  const [path, q] = location.hash.slice(1).split('?');
+  const p = (path || '/').split('/').filter(Boolean);
+  const qs = new URLSearchParams(q || '');
+  window.scrollTo(0, 0);
+  try {
+    if (!p.length) return await vBridges();
+    if (p[0] === 'most' && p[1] === 'novy') return await vBridgeEdit(null);
+    if (p[0] === 'most' && p[2] === 'upravit') return await vBridgeEdit(p[1]);
+    if (p[0] === 'most') return await vBridge(p[1]);
+    if (p[0] === 'prohlidka') return await vInsp(p[1]);
+    if (p[0] === 'kamera') return await vCamera(p[1], qs.get('k') || 'jine');
+    if (p[0] === 'foto') return await vPhoto(p[1], qs.get('dal') === '1');
+    if (p[0] === 'zavada') return await vDefect(p[1], p[2]);
+    if (p[0] === 'data') return await vData();
+    location.hash = '#/';
+  } catch (e) {
+    console.error(e);
+    app.innerHTML = `<div class="card"><h2>Chyba</h2><p>${esc(e.message || e)}</p><a class="btn" href="#/">Domů</a></div>`;
+  }
+}
+
+/* ---------- seznam mostů ---------- */
+async function vBridges() {
+  setTitle('Prohlídky mostů', null);
+  const bs = (await all('bridges')).sort((a, b) => String(a.evc).localeCompare(String(b.evc), 'cs', { numeric: true }));
+  const ins = await all('insp');
+  app.innerHTML = `
+    <div class="row" style="margin-bottom:12px">
+      <a class="btn pri grow" href="#/most/novy">+ Nový most</a>
+      <a class="btn" href="#/data">Data</a>
+    </div>
+    <div class="card">${bs.length ? `<ul class="list">${bs.map(b => {
+      const n = ins.filter(i => i.bridgeId === b.id), open = n.filter(i => !i.exportedAt).length;
+      return `<li><a class="grow" href="#/most/${b.id}"><b>${esc(b.evc)}</b> ${esc(b.nazev)}<div class="muted">${b.poli || 1} ${(b.poli | 0) > 1 ? 'polí' : 'pole'}${n.length ? ` · prohlídek ${n.length}` : ''}</div></a>${open ? `<span class="badge miss">neexportováno ${open}</span>` : ''}</li>`;
+    }).join('')}</ul>` : '<p class="muted">Zatím žádné mosty. Přidej most ručně (údaje z BMS) nebo hromadně importem v sekci Data.</p>'}</div>`;
+}
+
+/* ---------- most: editace ---------- */
+async function vBridgeEdit(id) {
+  const b = id ? await get('bridges', id) : { id: uid(), evc: '', nazev: '', lat: null, lon: null, poli: 1, az: null, smer: '', pozn: '' };
+  setTitle(id ? 'Upravit most' : 'Nový most', id ? `#/most/${id}` : '#/');
+  app.innerHTML = `<div class="card">
+    <label>Evidenční číslo</label><input id="evc" value="${esc(b.evc)}" placeholder="např. 118-039">
+    <label>Název</label><input id="nazev" value="${esc(b.nazev)}">
+    <label>Souřadnice WGS84 (z BMS, mapy.cz…)</label><input id="gps" value="${b.lat != null ? b.lat + ', ' + b.lon : ''}" placeholder="50.1234, 14.5678" inputmode="text">
+    <label>Počet polí</label><input id="poli" type="number" min="1" value="${b.poli || 1}">
+    <label>Staničení ve směru (text z BMS)</label><input id="smer" value="${esc(b.smer)}" placeholder="např. Nouzov → Kladno">
+    <label>Azimut směru staničení [°] – lze nastavit na místě kompasem</label><input id="az" type="number" step="1" min="0" max="359" value="${b.az ?? ''}">
+    <label>Poznámka</label><textarea id="pozn">${esc(b.pozn)}</textarea>
+    <div class="row" style="margin-top:12px"><button class="pri grow" id="save">Uložit</button>${id ? '<button class="bad" id="del">Smazat</button>' : ''}</div>
+  </div>`;
+  $('#save').onclick = async () => {
+    const g = parseCoords($('#gps').value);
+    if (g && g.err) return toast(g.err, 5000);
+    if ($('#gps').value.trim() && !g) return toast('Souřadnice nerozpoznány');
+    Object.assign(b, {
+      evc: $('#evc').value.trim(), nazev: $('#nazev').value.trim(), poli: Math.max(1, parseInt($('#poli').value) || 1),
+      smer: $('#smer').value.trim(), az: $('#az').value === '' ? null : ((+$('#az').value % 360) + 360) % 360, pozn: $('#pozn').value,
+      lat: g ? g.lat : null, lon: g ? g.lon : null,
+    });
+    if (!b.evc) return toast('Doplň evidenční číslo');
+    await put('bridges', b);
+    location.hash = `#/most/${b.id}`;
+  };
+  if (id) $('#del').onclick = async () => {
+    const n = (await all('insp')).filter(i => i.bridgeId === id).length;
+    if (n) return toast('Most má prohlídky – nejdřív je smaž.');
+    if (!confirm('Smazat most?')) return;
+    await del('bridges', id); location.hash = '#/';
+  };
+}
+
+/* ---------- most: detail ---------- */
+async function vBridge(id) {
+  const b = await get('bridges', id);
+  if (!b) { location.hash = '#/'; return; }
+  setTitle(`${b.evc}`, '#/');
+  const ins = (await all('insp')).filter(i => i.bridgeId === id).sort((a, c) => c.created - a.created);
+  const has = b.lat != null;
+  app.innerHTML = `
+    <div class="card"><h2>${esc(b.evc)} ${esc(b.nazev)}</h2>
+      <div class="kv">
+        <b>Souřadnice</b><span>${has ? num(b.lat, 6) + ', ' + num(b.lon, 6) : '[doplnit]'}</span>
+        <b>Polí</b><span>${b.poli || 1} (${supports(b).join(', ')})</span>
+        <b>Staničení</b><span>${esc(b.smer) || '–'}</span>
+        <b>Azimut stan.</b><span>${b.az != null ? Math.round(b.az) + '°' : '[nenastaven]'}</span>
+        <b>Vzdálenost</b><span id="dist">–</span>
+      </div>
+      ${b.pozn ? `<p class="muted">${esc(b.pozn)}</p>` : ''}
+      <div class="row" style="margin-top:10px">
+        ${has ? `<a class="btn grow" href="https://maps.apple.com/?daddr=${b.lat},${b.lon}&dirflg=d">Apple Mapy</a>
+        <a class="btn grow" href="https://www.google.com/maps/dir/?api=1&destination=${b.lat},${b.lon}">Google</a>
+        <a class="btn grow" href="https://mapy.cz/zakladni?source=coor&id=${b.lon},${b.lat}&x=${b.lon}&y=${b.lat}&z=17">Mapy.cz</a>` : ''}
+      </div>
+      <div class="row" style="margin-top:8px"><a class="btn grow" href="#/most/${id}/upravit">Upravit</a></div>
+    </div>
+    <div class="card"><h2>Směr staničení kompasem</h2>
+      <p class="muted">Postav se na most, namiř zadní stranu telefonu ve směru staničení a stiskni Uložit. Slouží k automatickému určení „zleva / zprava / po směru“ u fotek.</p>
+      <div class="row"><span class="grow" id="hud-sens">senzory vypnuty</span><button id="sens">Zapnout</button><button class="pri" id="setaz">Uložit</button></div>
+    </div>
+    <div class="card"><h2>Prohlídky</h2>
+      <div class="row"><select id="druh" class="grow">${Object.entries(DRUHY).map(([k, v]) => `<option value="${k}"${k === 'hlavni' ? ' selected' : ''}>${v}</option>`).join('')}</select>
+      <button class="pri" id="newi">+ Nová</button></div>
+      <ul class="list">${ins.map(i => `<li><a class="grow" href="#/prohlidka/${i.id}">${esc(DRUHY[i.druh])} – ${fmtDate(i.datum)}</a>${i.exportedAt ? '<span class="badge ok">export</span>' : '<span class="badge miss">rozpracováno</span>'}</li>`).join('')}</ul>
+    </div>`;
+  const upd = () => { if (has && S.lat != null) $('#dist').textContent = `${num(distM(S.lat, S.lon, b.lat, b.lon) / 1000, 2)} km`; hud(); };
+  if (S.on) upd();
+  const ti = setInterval(() => { if (!document.getElementById('dist')) return clearInterval(ti); upd(); }, 1000);
+  $('#sens').onclick = () => { ensureSensors(); toast('Senzory zapnuty'); };
+  $('#setaz').onclick = async () => {
+    ensureSensors();
+    if (S.heading == null) return toast('Kompas zatím nemá hodnotu – zapni senzory a chvíli počkej.');
+    b.az = Math.round(S.heading); await put('bridges', b); toast(`Azimut staničení ${b.az}° uložen`); route();
+  };
+  $('#newi').onclick = async () => {
+    const i = { id: uid(), bridgeId: id, druh: $('#druh').value, datum: isoDay(Date.now()), created: Date.now(),
+      pocasi: '', tVzd: '', tNK: '', zpristupneni: '', defects: [], na: {}, nextSeq: 0, exportedAt: null };
+    await put('insp', i);
+    location.hash = `#/prohlidka/${i.id}`;
+  };
+}
+
+/* ---------- prohlídka ---------- */
+async function vInsp(id) {
+  const i = await get('insp', id);
+  if (!i) { location.hash = '#/'; return; }
+  const b = await get('bridges', i.bridgeId);
+  const ph = (await photosOf(id)).sort((a, c) => a.seq - c.seq);
+  const items = checklist(b, i.druh);
+  setTitle(`${b.evc} – ${DRUHY[i.druh]}`, `#/most/${b.id}`);
+  const cnt = k => ph.filter(p => p.key === k).length;
+  const missing = items.filter(t => !cnt(t.key) && !i.na[t.key]).length;
+  const camLink = k => `#/kamera/${id}?k=${encodeURIComponent(k)}`;
+  app.innerHTML = `
+    <div class="card"><details><summary>Údaje o prohlídce</summary>
+      <label>Datum</label><input id="datum" type="date" value="${i.datum}">
+      <label>Druh</label><select id="druh">${Object.entries(DRUHY).map(([k, v]) => `<option value="${k}"${k === i.druh ? ' selected' : ''}>${v}</option>`).join('')}</select>
+      <label>Počasí</label><input id="pocasi" value="${esc(i.pocasi)}">
+      <div class="row"><div class="grow"><label>Teplota vzduchu [°C]</label><input id="tVzd" inputmode="decimal" value="${esc(i.tVzd)}"></div>
+      <div class="grow"><label>Teplota NK [°C]</label><input id="tNK" inputmode="decimal" value="${esc(i.tNK)}"></div></div>
+      <label>Způsob zpřístupnění</label><input id="zpr" value="${esc(i.zpristupneni)}">
+      <div class="row" style="margin-top:10px"><button class="pri grow" id="savei">Uložit údaje</button><button class="bad" id="deli">Smazat prohlídku</button></div>
+    </details></div>
+
+    <div class="row" style="margin-bottom:12px">
+      <a class="btn pri grow" href="${camLink('zavada')}" data-cam>📷 Závada</a>
+      <a class="btn grow" href="${camLink('jine')}" data-cam>📷 Jiné foto</a>
+    </div>
+
+    <div class="card"><h2>Povinné záběry (ČSN 73 6221, tab. 4) ${missing ? `<span class="badge miss">chybí ${missing}</span>` : '<span class="badge ok">kompletní</span>'}</h2>
+      <ul class="list">${items.map(t => {
+        const c = cnt(t.key), na = i.na[t.key];
+        return `<li><a class="grow" href="${camLink(t.key)}" data-cam>${esc(t.cap)}<div class="muted">${esc(GROUPS.find(g => g[0] === t.g)[1])}</div></a>
+          ${c ? `<span class="badge ok">${c}×</span>` : na ? '<span class="badge na">není</span>' : ''}
+          ${c ? '' : `<button class="small" data-na="${t.key}">${na ? 'vrátit' : 'není'}</button>`}</li>`;
+      }).join('')}</ul></div>
+
+    <div class="card"><h2>Závady (${i.defects.length})</h2>
+      <ul class="list">${i.defects.map(d => `<li><a class="grow" href="#/zavada/${id}/${d.id}"><b>č. ${d.n}</b> [${esc(d.code)}] ${esc(codeName(d.code))}<div class="muted">${esc(d.popis).slice(0, 140) || '[doplnit popis]'}</div></a><span class="badge">${ph.filter(p => p.defectId === d.id).length} foto</span></li>`).join('') || '<li class="muted">Zatím žádné.</li>'}</ul>
+      <button class="wide" id="newd" style="margin-top:8px">+ Závada bez fotky</button>
+    </div>
+
+    <div class="card"><h2>Fotky (${ph.length}, ve zprávě ${ph.filter(p => p.include).length})</h2>
+      <div class="grid">${ph.map(p => `<a class="thumb${p.include ? '' : ' off'}" href="#/foto/${p.id}"><img loading="lazy" src="${blobUrl(p.blob)}" alt=""><span class="n">${p.seq}</span><span class="cap">${esc(p.caption)}</span></a>`).join('')}</div>
+    </div>
+
+    <div class="card"><h2>Export</h2>
+      <p class="muted">ZIP: zmenšené fotky s datem a názvy, text pro BMS (popisy, závady, seznam příloh), nahrávky a data JSON. ${i.exportedAt ? 'Naposledy ' + fmtDate(i.exportedAt) + ' ' + fmtTime(i.exportedAt) + '.' : 'Zatím neexportováno.'}</p>
+      <button class="pri wide" id="exp">Exportovat ZIP</button>
+    </div>`;
+  app.querySelectorAll('[data-cam]').forEach(a => a.addEventListener('click', ensureSensors));
+  app.querySelectorAll('[data-na]').forEach(bt => bt.onclick = async () => {
+    const k = bt.dataset.na; if (i.na[k]) delete i.na[k]; else i.na[k] = true;
+    await put('insp', i); route();
+  });
+  $('#savei').onclick = async () => {
+    Object.assign(i, { datum: $('#datum').value || i.datum, druh: $('#druh').value, pocasi: $('#pocasi').value, tVzd: $('#tVzd').value, tNK: $('#tNK').value, zpristupneni: $('#zpr').value });
+    await put('insp', i); toast('Uloženo'); route();
+  };
+  $('#deli').onclick = async () => {
+    if (!confirm(`Smazat prohlídku včetně ${ph.length} fotek? Nelze vrátit.`)) return;
+    for (const p of ph) await del('photos', p.id);
+    await del('insp', id); location.hash = `#/most/${b.id}`;
+  };
+  $('#newd').onclick = async () => {
+    const d = newDefect(i); await put('insp', i); location.hash = `#/zavada/${id}/${d.id}`;
+  };
+  $('#exp').onclick = async () => {
+    const bt = $('#exp'); bt.disabled = true; bt.textContent = 'Připravuji…';
+    try {
+      const { blob, name } = await buildExport(i, b, ph);
+      const ok = await saveFile(blob, name);
+      if (ok) { i.exportedAt = Date.now(); await put('insp', i); toast('Exportováno'); }
+    } catch (e) { toast('Export selhal: ' + e.message, 5000); }
+    route();
+  };
+}
+function newDefect(i, code = '2.1') {
+  const d = { id: uid(), n: Math.max(0, ...i.defects.map(x => x.n)) + 1, code, popis: '', opatreni: '' };
+  i.defects.push(d); return d;
+}
+
+/* ---------- kamera ---------- */
+async function vCamera(inspId, key) {
+  const i = await get('insp', inspId), b = await get('bridges', i.bridgeId);
+  const item = checklist(b, i.druh).find(t => t.key === key);
+  const label = item ? item.cap : key === 'zavada' ? 'Závada' : 'Jiné foto';
+  hudCtx = { az: b.az };
+  app.innerHTML = `<div class="cam">
+    <video id="v" playsinline autoplay muted></video>
+    <div class="hud"><span class="tgt">${esc(label)}</span><span id="hud-sens"></span></div>
+    <div class="bar">
+      <button id="x">Zpět</button>
+      <button id="shot" class="shutter" aria-label="Vyfotit"></button>
+      <label class="btn" id="natl">Fotoaparát<input id="nat" type="file" accept="image/*" capture="environment" hidden></label>
+    </div></div>`;
+  hud();
+  $('#x').onclick = () => { location.hash = `#/prohlidka/${inspId}`; };
+  let metaNat = null;
+  $('#natl').addEventListener('click', () => { metaNat = snap(); metaNat.src = 'fotoaparat'; });
+  $('#nat').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    await storePhoto(i, b, key, item, f, metaNat || snap());
+  };
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } } });
+    const v = $('#v'); v.srcObject = stream;
+  } catch (e) {
+    toast('Kamera v aplikaci nedostupná – použij tlačítko Fotoaparát.', 4000);
+    $('#shot').disabled = true;
+  }
+  $('#shot').onclick = async () => {
+    const v = $('#v'); if (!v.videoWidth) return;
+    const meta = snap(); meta.src = 'aplikace';
+    const fl = document.createElement('div'); fl.className = 'flash'; document.body.appendChild(fl); setTimeout(() => fl.remove(), 120);
+    const c = document.createElement('canvas'); c.width = v.videoWidth; c.height = v.videoHeight;
+    c.getContext('2d').drawImage(v, 0, 0);
+    const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.95));
+    await storePhoto(i, b, key, item, blob, meta);
+  };
+}
+async function storePhoto(i, b, key, item, src, meta) {
+  toast('Ukládám…', 1500);
+  const blob = await processImage(src, new Date(meta.ts));
+  i = await get('insp', i.id);           // čerstvý stav (pořadí)
+  i.nextSeq = (i.nextSeq || 0) + 1;
+  await put('insp', i);
+  const dir = dirWord(meta.heading, b.az);
+  const p = { id: uid(), inspId: i.id, seq: i.nextSeq, key, blob, ...meta, dir, caption: defaultCaption(item, dir),
+    include: true, defectId: null, audio: null, note: '' };
+  await put('photos', p);
+  location.hash = `#/foto/${p.id}?dal=1`;
+}
+
+/* ---------- editace fotky ---------- */
+async function vPhoto(id, fromCam) {
+  const p = await get('photos', id);
+  if (!p) { location.hash = '#/'; return; }
+  const i = await get('insp', p.inspId), b = await get('bridges', i.bridgeId);
+  const items = checklist(b, i.druh);
+  setTitle(`Foto ${p.seq}`, `#/prohlidka/${i.id}`);
+  const isDef = p.key === 'zavada';
+  const keyOpts = [...items.map(t => [t.key, t.cap]), ['zavada', 'Závada'], ['jine', 'Jiné']];
+  app.innerHTML = `
+    <img class="preview" src="${blobUrl(p.blob)}" alt="">
+    <div class="card" style="margin-top:12px">
+      <label>Zařazení</label><select id="key">${keyOpts.map(([k, v]) => `<option value="${k}"${k === p.key ? ' selected' : ''}>${esc(v)}</option>`).join('')}</select>
+      <div id="defbox" ${isDef ? '' : 'hidden'}>
+        <label>Závada</label><select id="def"><option value="">+ nová závada</option>${i.defects.map(d => `<option value="${d.id}"${d.id === p.defectId ? ' selected' : ''}>č. ${d.n} [${esc(d.code)}] ${esc(d.popis.slice(0, 40))}</option>`).join('')}</select>
+        <div id="newdef" ${p.defectId ? 'hidden' : ''}>
+          <label>Část mostu (kód BMS)</label><select id="code">${CODES.map(([c, n]) => `<option value="${c}">${c} ${esc(n)}</option>`).join('')}</select>
+          <label>Popis závady (diktuj mikrofonem na klávesnici)</label><textarea id="popis" placeholder="např. Podélná trhlina šířky cca 0,3 mm na podhledu NK v poli 2, délka cca 1,5 m."></textarea>
+        </div>
+      </div>
+      <label>Popisek fotky</label><textarea id="cap" style="min-height:60px">${esc(p.caption)}</textarea>
+      <label>Poznámka (nejde do popisku)</label><input id="note" value="${esc(p.note)}">
+      <label style="color:var(--fg)"><input type="checkbox" id="inc" ${p.include ? 'checked' : ''}>Použít ve zprávě</label>
+      <div class="row" style="margin-top:8px"><button id="rec">🎙 ${p.audio ? 'Nahrát znovu' : 'Nahrát hlas'}</button><span id="recst" class="muted grow"></span></div>
+      ${p.audio ? `<audio controls src="${blobUrl(p.audio)}" style="width:100%;margin-top:8px"></audio>` : ''}
+      <div class="row" style="margin-top:12px">
+        ${fromCam ? '<button class="pri grow" id="savenext">Uložit a fotit dál</button>' : ''}
+        <button class="${fromCam ? '' : 'pri '}grow" id="save">Uložit</button>
+      </div>
+      <button class="bad wide" id="delp" style="margin-top:8px">Smazat fotku</button>
+    </div>
+    <div class="card"><div class="kv">
+      <b>Pořízeno</b><span>${fmtDate(p.ts)} ${fmtTime(p.ts)} (${p.src === 'fotoaparat' ? 'Fotoaparát iOS – azimut z okamžiku otevření' : 'kamera v aplikaci'})</span>
+      <b>GPS</b><span>${p.lat != null ? `${num(p.lat, 6)}, ${num(p.lon, 6)} ±${Math.round(p.acc)} m` : '–'}</span>
+      <b>Azimut</b><span>${p.heading != null ? Math.round(p.heading) + '°' : '–'}${p.dir ? ' → ' + p.dir : ''}</span>
+      <b>Velikost</b><span>${num(p.blob.size / 1024, 0)} kB</span>
+    </div></div>`;
+  const syncKey = () => {
+    const k = $('#key').value, it = items.find(t => t.key === k);
+    $('#defbox').hidden = k !== 'zavada';
+    if (it && (!$('#cap').value.trim() || $('#cap').dataset.auto !== '0')) $('#cap').value = defaultCaption(it, p.dir);
+  };
+  $('#cap').addEventListener('input', () => { $('#cap').dataset.auto = '0'; });
+  $('#key').onchange = syncKey;
+  $('#def').onchange = () => { $('#newdef').hidden = !!$('#def').value; };
+  let audio = p.audio, chunks = [];
+  $('#rec').onclick = async () => {
+    if (recorder && recorder.state === 'recording') { recorder.stop(); return; }
+    try {
+      const ms = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recorder = new MediaRecorder(ms); chunks = [];
+      recorder.ondataavailable = e => chunks.push(e.data);
+      recorder.onstop = () => {
+        ms.getTracks().forEach(t => t.stop());
+        audio = new Blob(chunks, { type: recorder.mimeType || 'audio/mp4' });
+        $('#recst').textContent = `nahráno ${num(audio.size / 1024, 0)} kB – ulož fotku`;
+        $('#rec').textContent = '🎙 Nahrát znovu';
+      };
+      recorder.start();
+      $('#rec').textContent = '⏹ Stop'; $('#recst').innerHTML = '<span class="rec">● nahrávám</span>';
+    } catch (e) { toast('Mikrofon nedostupný: ' + e.message, 4000); }
+  };
+  const save = async () => {
+    if (recorder && recorder.state === 'recording') { recorder.stop(); await new Promise(r => setTimeout(r, 300)); }
+    const i2 = await get('insp', p.inspId);
+    p.key = $('#key').value; p.caption = $('#cap').value.trim(); p.note = $('#note').value; p.include = $('#inc').checked; p.audio = audio;
+    if (p.key === 'zavada') {
+      let d = i2.defects.find(x => x.id === $('#def').value);
+      if (!d) {
+        d = newDefect(i2, $('#code').value); d.popis = $('#popis').value.trim();
+        await put('insp', i2);
+      }
+      p.defectId = d.id;
+      if (!p.caption) p.caption = `Závada č. ${d.n}${d.popis ? ' – ' + d.popis.split(/[.,;]/)[0] : ''}.`;
+    } else p.defectId = null;
+    await put('photos', p);
+    return i2;
+  };
+  if (fromCam) $('#savenext').onclick = async () => { await save(); location.hash = `#/kamera/${p.inspId}?k=${encodeURIComponent(p.key)}`; };
+  $('#save').onclick = async () => { await save(); location.hash = `#/prohlidka/${p.inspId}`; };
+  $('#delp').onclick = async () => { if (!confirm('Smazat fotku?')) return; await del('photos', id); location.hash = `#/prohlidka/${p.inspId}`; };
+}
+
+/* ---------- závada ---------- */
+async function vDefect(inspId, defId) {
+  const i = await get('insp', inspId);
+  const d = i.defects.find(x => x.id === defId);
+  if (!d) { location.hash = `#/prohlidka/${inspId}`; return; }
+  const ph = (await photosOf(inspId)).filter(p => p.defectId === defId).sort((a, b) => a.seq - b.seq);
+  setTitle(`Závada č. ${d.n}`, `#/prohlidka/${inspId}`);
+  app.innerHTML = `<div class="card">
+    <label>Část mostu (kód BMS)</label><select id="code">${CODES.map(([c, n]) => `<option value="${c}"${c === d.code ? ' selected' : ''}>${c} ${esc(n)}</option>`).join('')}</select>
+    <label>Popis závady</label><textarea id="popis">${esc(d.popis)}</textarea>
+    <label>Návrh opatření</label><textarea id="opat">${esc(d.opatreni)}</textarea>
+    <div class="row" style="margin-top:12px"><button class="pri grow" id="save">Uložit</button><a class="btn" href="#/kamera/${inspId}?k=zavada" id="foto">📷 Přidat foto</a></div>
+    <button class="bad wide" id="deld" style="margin-top:8px">Smazat závadu</button></div>
+    <div class="card"><h2>Fotky (${ph.length})</h2><div class="grid">${ph.map(p => `<a class="thumb" href="#/foto/${p.id}"><img src="${blobUrl(p.blob)}" alt=""><span class="n">${p.seq}</span></a>`).join('')}</div></div>`;
+  const save = async () => { d.code = $('#code').value; d.popis = $('#popis').value.trim(); d.opatreni = $('#opat').value.trim(); await put('insp', i); };
+  $('#save').onclick = async () => { await save(); location.hash = `#/prohlidka/${inspId}`; };
+  $('#foto').addEventListener('click', async ev => { ensureSensors(); await save(); });
+  $('#deld').onclick = async () => {
+    if (!confirm('Smazat závadu? Fotky zůstanou jako „Jiné“.')) return;
+    for (const p of ph) { p.defectId = null; p.key = 'jine'; await put('photos', p); }
+    i.defects = i.defects.filter(x => x.id !== defId); await put('insp', i); location.hash = `#/prohlidka/${inspId}`;
+  };
+}
+
+/* ---------- export ---------- */
+async function buildExport(i, b, ph) {
+  const items = checklist(b, i.druh), order = new Map(items.map((t, k) => [t.key, k]));
+  const defN = new Map(i.defects.map(d => [d.id, d.n]));
+  const sorted = [...ph].sort((a, c) =>
+    groupIdx(a.key) - groupIdx(c.key) ||
+    (order.get(a.key) ?? 999) - (order.get(c.key) ?? 999) ||
+    (defN.get(a.defectId) ?? 0) - (defN.get(c.defectId) ?? 0) ||
+    a.seq - c.seq);
+  const used = sorted.filter(p => p.include), unused = sorted.filter(p => !p.include);
+  // stejné popisky → " /1", " /2" (styl HPM)
+  const capCount = {}; used.forEach(p => { capCount[p.caption] = (capCount[p.caption] || 0) + 1; });
+  const capIdx = {};
+  const finalCap = p => { if (capCount[p.caption] > 1) { capIdx[p.caption] = (capIdx[p.caption] || 0) + 1; return `${p.caption} /${capIdx[p.caption]}`; } return p.caption; };
+  const pre = slug(b.evc), files = [], rows = [], photoNo = new Map();
+  used.forEach((p, k) => {
+    const n = String(k + 1).padStart(2, '0'), cap = finalCap(p) || 'bez popisku';
+    const name = `${n}_${pre}_${slug(cap)}.jpg`;
+    photoNo.set(p.id, k + 1);
+    files.push({ name: `foto/${name}`, data: p.blob });
+    if (p.audio) files.push({ name: `audio/${n}_${pre}.${/mp4|m4a|aac/.test(p.audio.type) ? 'm4a' : 'webm'}`, data: p.audio });
+    rows.push(`${n}\t${cap}\t${name}${p.note ? '\t(pozn.: ' + p.note + ')' : ''}`);
+  });
+  unused.forEach((p, k) => {
+    const n = 'x' + String(k + 1).padStart(2, '0');
+    files.push({ name: `nepouzite/${n}_${pre}_${slug(p.caption || 'foto')}.jpg`, data: p.blob });
+    if (p.audio) files.push({ name: `audio/${n}_${pre}.m4a`, data: p.audio });
+  });
+  const L = [];
+  L.push(`${DRUHY[i.druh].toUpperCase()} PROHLÍDKA – most ev. č. ${b.evc} ${b.nazev}`);
+  L.push(`Datum provedení prohlídky: ${fmtDate(i.datum)}`);
+  L.push(`Počasí: ${i.pocasi || '[doplnit]'}`);
+  L.push(`Způsob zpřístupnění: ${i.zpristupneni || '[doplnit]'}`);
+  L.push(`Teplota vzduchu: ${i.tVzd !== '' ? i.tVzd + ' °C' : '[doplnit]'}    Teplota NK: ${i.tNK !== '' ? i.tNK + ' °C' : '[doplnit]'}`);
+  if (b.smer) L.push(`Staničení ve směru: ${b.smer}`);
+  L.push('', 'C. STAV A ZÁVADY ČÁSTÍ MOSTU');
+  const byCode = {};
+  [...i.defects].sort((a, c) => a.code.localeCompare(c.code, 'cs', { numeric: true }) || a.n - c.n).forEach(d => { (byCode[d.code] = byCode[d.code] || []).push(d); });
+  for (const [code, ds] of Object.entries(byCode)) {
+    L.push('', `[${code}] ${codeName(code)}`);
+    ds.forEach(d => {
+      const f = ph.filter(p => p.defectId === d.id && photoNo.has(p.id)).map(p => photoNo.get(p.id)).sort((a, c) => a - c);
+      L.push(`${d.popis || '[doplnit popis]'}${f.length ? ` (foto ${f.join(', ')})` : ''}`);
+    });
+  }
+  if (!i.defects.length) L.push('Bez zaznamenaných závad.');
+  L.push('', 'E. NÁVRH OPATŘENÍ');
+  const op = i.defects.filter(d => d.opatreni);
+  op.forEach(d => L.push(`[${d.code}] ${codeName(d.code)}: ${d.opatreni}`));
+  if (!op.length) L.push('[doplnit]');
+  L.push('', 'J. OBRAZOVÉ PŘÍLOHY (pořadí, popisek, soubor)', ...rows);
+  const miss = items.filter(t => !ph.some(p => p.key === t.key && p.include) && !i.na[t.key]);
+  L.push('', 'KONTROLA FOTODOKUMENTACE (ČSN 73 6221, tab. 4 – doporučený rozsah)');
+  if (miss.length) miss.forEach(t => L.push('- chybí: ' + t.cap));
+  else L.push('Všechny doporučené záběry pořízeny nebo označeny „není“.');
+  items.filter(t => i.na[t.key]).forEach(t => L.push('- není/nelze: ' + t.cap));
+  L.push('', `Export: ${fmtDate(Date.now())} ${fmtTime(Date.now())}, aplikace Prohlídky mostů ${APP_VERSION}`);
+  files.unshift({ name: 'prohlidka.txt', data: '﻿' + L.join('\r\n') });
+  const meta = { app: APP_VERSION, bridge: b, inspection: i,
+    photos: sorted.map(p => ({ ...p, blob: undefined, audio: !!p.audio, cislo: photoNo.get(p.id) || null })) };
+  files.push({ name: 'data.json', data: JSON.stringify(meta, null, 1) });
+  return { blob: await makeZip(files), name: `${pre}_${i.druh}_${i.datum}.zip` };
+}
+
+/* ---------- data: import/záloha mostů ---------- */
+async function vData() {
+  setTitle('Data', '#/');
+  let est = '';
+  try { const e = await navigator.storage.estimate(); est = `${num(e.usage / 1048576, 1)} MB z ${num(e.quota / 1048576, 0)} MB`; } catch (e) { /* */ }
+  const pers = navigator.storage && navigator.storage.persisted ? await navigator.storage.persisted() : false;
+  app.innerHTML = `
+    <div class="card"><h2>Import mostů (CSV)</h2>
+      <p class="muted">Řádek: <code>ev.č.;název;šířka;délka;počet polí;staničení ve směru</code>. Oddělovač středník, desetinná čárka i tečka. Existující ev. č. se aktualizuje.</p>
+      <textarea id="csv" placeholder="118-039;Most přes potok Čeperka u osady Nouzov;50,1234;14,0567;1;Nouzov → Kladno"></textarea>
+      <div class="row" style="margin-top:8px"><button class="pri grow" id="imp">Importovat</button><label class="btn">Ze souboru<input type="file" id="csvf" accept=".csv,.txt,text/plain" hidden></label></div>
+    </div>
+    <div class="card"><h2>Záloha seznamu mostů</h2>
+      <button class="wide" id="bk">Exportovat mosty (CSV)</button>
+    </div>
+    <div class="card"><h2>Úložiště</h2>
+      <div class="kv"><b>Využito</b><span>${est || '–'}</span><b>Trvalé</b><span>${pers ? 'ano' : 'ne'}</span><b>Verze</b><span>${APP_VERSION}</span></div>
+      <p class="muted">Fotky jsou jen v tomto telefonu. Po každé prohlídce udělej export ZIP.</p>
+      ${pers ? '' : '<button class="wide" id="persist">Požádat o trvalé úložiště</button>'}
+    </div>`;
+  const doImport = async txt => {
+    const bs = await all('bridges'); let n = 0, bad = [];
+    txt.split(/\r?\n/).map(l => l.trim()).filter(Boolean).forEach((l, k) => {
+      const c = l.split(';').map(x => x.trim());
+      if (c.length < 4 || /^ev/i.test(c[0])) { if (!/^ev/i.test(c[0])) bad.push(k + 1); return; }
+      const g = parseCoords(c[2] + ' ' + c[3]);
+      if (!g || g.err) { bad.push(k + 1); return; }
+      let b = bs.find(x => x.evc === c[0]);
+      if (!b) { b = { id: uid(), az: null, pozn: '' }; bs.push(b); }
+      Object.assign(b, { evc: c[0], nazev: c[1], lat: g.lat, lon: g.lon, poli: Math.max(1, parseInt(c[4]) || b.poli || 1), smer: c[5] || b.smer || '' });
+      b._dirty = true; n++;
+    });
+    for (const b of bs.filter(x => x._dirty)) { delete b._dirty; await put('bridges', b); }
+    toast(`Importováno ${n}${bad.length ? ', chybné řádky: ' + bad.join(', ') : ''}`, 5000);
+  };
+  $('#imp').onclick = () => doImport($('#csv').value);
+  $('#csvf').onchange = async e => { const f = e.target.files[0]; if (f) doImport(await f.text()); };
+  $('#bk').onclick = async () => {
+    const bs = await all('bridges');
+    const t = bs.map(b => [b.evc, b.nazev, b.lat ?? '', b.lon ?? '', b.poli || 1, b.smer || ''].join(';')).join('\r\n');
+    saveFile(new Blob(['﻿' + t], { type: 'text/csv' }), `mosty_${isoDay(Date.now())}.csv`);
+  };
+  if (!pers && $('#persist')) $('#persist').onclick = async () => { const r = navigator.storage.persist ? await navigator.storage.persist() : false; toast(r ? 'Úložiště je trvalé' : 'Systém trvalé úložiště nepovolil'); route(); };
+}
+
+/* ---------- start ---------- */
+$('#ver').textContent = 'v' + APP_VERSION;
+window.addEventListener('hashchange', route);
+route();
+if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
