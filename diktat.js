@@ -103,6 +103,29 @@
     return s;
   }
 
+  /* Slova, která diktát iOS píše místo odborného termínu („si“ místo „římsy“).
+     Tvar se volí podle předchozího slova, klepnutím v návrhu se přepíná na další tvary. */
+  const RIMSA = ['římsy', 'římsa', 'římse', 'římsu', 'římsou'];
+  const HOMO = { si: RIMSA, sy: RIMSA, rýmy: RIMSA, rýmsy: RIMSA, rímsy: RIMSA, římsi: RIMSA, ryms: RIMSA };
+  function homophone(t, tok, i) {
+    const forms = HOMO[t.toLowerCase()]; if (!forms) return null;
+    const words = []; // předchozí slova ve stejné větě
+    for (let k = i - 1; k >= 0 && words.length < 2; k--) {
+      if (/[.!?]/.test(tok[k])) break;
+      if (rx(`^[${L}]+$`, 'u').test(tok[k])) words.push(tok[k].toLowerCase());
+    }
+    const [p1 = '', p2 = ''] = words;
+    let f = 'římsy';                                                         // degradace (levé) římsy
+    if (!p1 || ['levá', 'pravá', 'obě', 'krajní'].includes(p1) && !p2) f = 'římsa';
+    if (['levá', 'pravá'].includes(p1)) f = 'římsa';
+    if (['na', 'pod', 'za', 'přes', 'levou', 'pravou', 'celou'].includes(p1)) f = 'římsu';   // pohled na (levou) římsu
+    if (['v', 've', 'o', 'při'].includes(p1) || (['levé', 'pravé'].includes(p1) && ['v', 've', 'o', 'při'].includes(p2))) f = 'římse';
+    if (['s', 'se', 'pod', 'nad', 'mezi', 'před', 'za'].includes(p2) && ['levou', 'pravou'].includes(p1)) f = 'římsou';
+    if (['obě', 'obou'].includes(p1)) f = 'římsy';
+    const order = [f, ...forms.filter(x => x !== f)];
+    return t[0] === t[0].toUpperCase() || !p1 ? order.map(x => x[0].toUpperCase() + x.slice(1)) : order;
+  }
+
   /* Návrh opravy: vrací {text, parts:[{o, r, fuzzy}]} nebo null */
   function suggest(text, kind) {
     if (!text || !text.trim()) return null;
@@ -112,12 +135,15 @@
     const isW = t => rx(`^[${L}]+$`, 'u').test(t);
     // slepení rozdělených slov („svod idla“ → „svodidla“)
     for (let i = 0; i + 2 < tok.length; i++) {
-      if (isW(tok[i]) && tok[i + 1] === ' ' && isW(tok[i + 2]) && (!known(tok[i]) || !known(tok[i + 2]))) {
+      if (isW(tok[i]) && tok[i + 1] === ' ' && isW(tok[i + 2]) && tok[i].length >= 2 && tok[i + 2].length >= 2 &&
+          !HOMO[tok[i].toLowerCase()] && !HOMO[tok[i + 2].toLowerCase()] && (!known(tok[i]) || !known(tok[i + 2]))) {
         const j = tok[i] + tok[i + 2];
         if (freq(j) >= 2) { tok.splice(i, 3, j); }
       }
     }
-    const parts = tok.map(t => {
+    const parts = tok.map((t, i) => {
+      const alt = homophone(t, tok, i);
+      if (alt) return { o: t, r: alt[0], fuzzy: true, alts: [...alt, t], ai: 0 };
       if (!isW(t) || t.length < 4 || known(t) || /\d/.test(t)) return { o: t, r: t };
       const r = nearest(t);
       return r ? { o: t, r, fuzzy: true } : { o: t, r: t };
@@ -224,8 +250,10 @@
     fixbar.addEventListener('click', e => {
       const fz = e.target.closest('.fz');
       if (fz) { // přepnout jednotlivou opravu zpět na původní slovo
-        const p = cur.parts[+fz.dataset.i]; [p.r, p.o] = [p.o, p.r]; p.fuzzy = true;
-        fz.textContent = p.r; fz.classList.toggle('off'); return;
+        const p = cur.parts[+fz.dataset.i];
+        if (p.alts) { p.ai = (p.ai + 1) % p.alts.length; p.r = p.alts[p.ai]; fz.classList.toggle('off', p.ai === p.alts.length - 1); }
+        else { [p.r, p.o] = [p.o, p.r]; fz.classList.toggle('off'); }
+        fz.textContent = p.r; return;
       }
       const a = e.target.dataset.a;
       if (a === 'ok') {
