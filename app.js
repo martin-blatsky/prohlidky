@@ -1,7 +1,8 @@
 'use strict';
 /* Prohlídky mostů – PWA pro sběr fotodokumentace a závad v terénu.
    Data zůstávají v zařízení (IndexedDB), ven jen přes export ZIP. */
-const APP_VERSION = '0.1.0';
+const APP_VERSION = '0.3.0';
+const LEAF = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/';
 const MAXPX = 2048;          // delší strana zmenšené fotky [px]
 const TARGET = 550 * 1024;   // cílová velikost JPEG [B]
 
@@ -149,6 +150,42 @@ function parseCoords(s) {
   const lat = Math.max(v[0], v[1]), lon = Math.min(v[0], v[1]); // v ČR je šířka (48–51) větší než délka (12–19)
   return { lat, lon };
 }
+/* S-JTSK (Křovák, Bessel) → WGS84. Vstup v podobě BMS (záporné X = −Y_JTSK, Y = −X_JTSK).
+   Ověřeno na 605-026: BMS zobrazuje 49,966861 N / 14,075390 E pro X=-769210.396, Y=-1052861.912. */
+function jtsk2wgs(bx, by, H = 245) {
+  const X = Math.abs(by), Y = Math.abs(bx);
+  const a = 6377397.15508, e = 0.081696831215303, n = 0.97992470462083, kro = 12310230.12797036,
+    sinUQ = 0.863499969506341, cosUQ = 0.504348889819882, sinVQ = 0.420215144586493, cosVQ = 0.907424504992097,
+    alfa = 1.000597498371542, k = 1.003419163966575;
+  let ro = Math.sqrt(X * X + Y * Y);
+  const D = 2 * Math.atan(Y / (ro + X)) / n, S = 2 * Math.atan(Math.exp(1 / n * Math.log(kro / ro))) - Math.PI / 2;
+  const sinS = Math.sin(S), cosS = Math.cos(S), sinD = Math.sin(D), cosD = Math.cos(D);
+  const sinU = sinUQ * sinS - cosUQ * cosS * cosD, cosU = Math.sqrt(1 - sinU * sinU);
+  const sinDV = sinD * cosS / cosU, cosDV = Math.sqrt(1 - sinDV * sinDV);
+  const sinV = sinVQ * cosDV - cosVQ * sinDV, cosV = cosVQ * cosDV + sinVQ * sinDV;
+  const Lj = 2 * Math.atan(sinV / (1 + cosV)) / alfa;
+  let t = Math.exp(2 / alfa * Math.log((1 + sinU) / cosU / k)), pom = (t - 1) / (t + 1), sinB, it = 0;
+  do { sinB = pom; pom = t * Math.exp(e * Math.log((1 + e * sinB) / (1 - e * sinB))); pom = (pom - 1) / (pom + 1); } while (Math.abs(pom - sinB) > 1e-15 && ++it < 50);
+  const Bj = Math.atan(pom / Math.sqrt(1 - pom * pom));
+  const e2 = 1 - (1 - 1 / 299.152812853) ** 2; ro = a / Math.sqrt(1 - e2 * Math.sin(Bj) ** 2);
+  const x = (ro + H) * Math.cos(Bj) * Math.cos(Lj), y = (ro + H) * Math.cos(Bj) * Math.sin(Lj), z = ((1 - e2) * ro + H) * Math.sin(Bj);
+  const r = Math.PI / 180 / 3600, wz = -5.2611 * r, wy = -1.58676 * r, wx = -4.99821 * r, m = 3.543e-6;
+  const xn = 570.69 + (1 + m) * (x + wz * y - wy * z), yn = 85.69 + (1 + m) * (-wz * x + y + wx * z), zn = 462.84 + (1 + m) * (wy * x - wx * y + z);
+  const aW = 6378137.0, fW = 298.257223563, ab = fW / (fW - 1), p = Math.sqrt(xn * xn + yn * yn), e2W = 1 - (1 - 1 / fW) ** 2;
+  const th = Math.atan(zn * ab / p), st = Math.sin(th), ct = Math.cos(th);
+  const tt = (zn + e2W * ab * aW * st ** 3) / (p - e2W * aW * ct ** 3);
+  return { lat: Math.atan(tt) * 180 / Math.PI, lon: 2 * Math.atan(yn / (p + xn)) * 180 / Math.PI };
+}
+const normEvc = s => String(s || '').replace(/\s+/g, '').toUpperCase();
+async function dataUrlToBlob(u) { return u ? (await fetch(u)).blob() : null; }
+/* overlay pro zvětšení obrázku */
+function showBig(url, cap) {
+  const o = document.createElement('div');
+  o.style.cssText = 'position:fixed;inset:0;z-index:200;background:rgba(0,0,0,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:12px';
+  o.innerHTML = `<img src="${url}" style="max-width:100%;max-height:85vh;border-radius:8px"><div style="color:#fff;margin-top:8px;text-align:center">${esc(cap || '')}</div>`;
+  o.onclick = () => o.remove();
+  document.body.appendChild(o);
+}
 function distM(a, b, c, d) {
   const R = 6371000, r = Math.PI / 180;
   const x = Math.sin((c - a) * r / 2) ** 2 + Math.cos(a * r) * Math.cos(c * r) * Math.sin((d - b) * r / 2) ** 2;
@@ -256,8 +293,10 @@ async function saveFile(blob, name) {
 }
 
 /* ---------- router ---------- */
-let stream = null, recorder = null;
+let stream = null, recorder = null, mapObj = null, mapTimer = null;
 function cleanup() {
+  if (mapTimer) { clearInterval(mapTimer); mapTimer = null; }
+  if (mapObj) { mapObj.remove(); mapObj = null; }
   if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
   if (recorder && recorder.state === 'recording') recorder.stop();
   recorder = null; hudCtx = null;
@@ -279,6 +318,9 @@ async function route() {
     if (p[0] === 'foto') return await vPhoto(p[1], qs.get('dal') === '1');
     if (p[0] === 'zavada') return await vDefect(p[1], p[2]);
     if (p[0] === 'data') return await vData();
+    if (p[0] === 'mapa') return await vMap(p[1] === 'vse');
+    if (p[0] === 'minula') return await vPrev(p[1]);
+    if (p[0] === 'popis') return await vDesc(p[1]);
     location.hash = '#/';
   } catch (e) {
     console.error(e);
@@ -289,17 +331,95 @@ async function route() {
 /* ---------- seznam mostů ---------- */
 async function vBridges() {
   setTitle('Prohlídky mostů', null);
-  const bs = (await all('bridges')).sort((a, b) => String(a.evc).localeCompare(String(b.evc), 'cs', { numeric: true }));
+  const today = isoDay(Date.now());
+  const bs = (await all('bridges')).sort((a, b) => (b.plan === today) - (a.plan === today) || String(a.evc).localeCompare(String(b.evc), 'cs', { numeric: true }));
   const ins = await all('insp');
+  const nToday = bs.filter(b => b.plan === today).length;
   app.innerHTML = `
     <div class="row" style="margin-bottom:12px">
       <a class="btn pri grow" href="#/most/novy">+ Nový most</a>
+      <a class="btn" href="#/mapa${nToday ? '' : '/vse'}">🗺 Mapa</a>
       <a class="btn" href="#/data">Data</a>
     </div>
-    <div class="card">${bs.length ? `<ul class="list">${bs.map(b => {
-      const n = ins.filter(i => i.bridgeId === b.id), open = n.filter(i => !i.exportedAt).length;
-      return `<li><a class="grow" href="#/most/${b.id}"><b>${esc(b.evc)}</b> ${esc(b.nazev)}<div class="muted">${b.poli || 1} ${(b.poli | 0) > 1 ? 'polí' : 'pole'}${n.length ? ` · prohlídek ${n.length}` : ''}</div></a>${open ? `<span class="badge miss">neexportováno ${open}</span>` : ''}</li>`;
+    <div class="card">${bs.length ? `<p class="muted" style="margin:0 0 4px">Tlačítkem „dnes“ označ mosty, na které dnes jedeš – zobrazí se nahoře a na mapě.</p><ul class="list">${bs.map(b => {
+      const n = ins.filter(i => i.bridgeId === b.id), open = n.filter(i => !i.exportedAt).length, pl = b.plan === today;
+      return `<li><a class="grow" href="#/most/${b.id}"><b>${esc(b.evc)}</b> ${esc(b.nazev)}<div class="muted">${b.poli || 1} ${(b.poli | 0) > 1 ? 'polí' : 'pole'}${n.length ? ` · prohlídek ${n.length}` : ''}${b.lat == null ? ' · bez souřadnic' : ''}</div></a>${open ? `<span class="badge miss">neexp. ${open}</span>` : ''}<button class="small${pl ? ' pri' : ''}" data-plan="${b.id}">${pl ? '✓ dnes' : 'dnes'}</button></li>`;
     }).join('')}</ul>` : '<p class="muted">Zatím žádné mosty. Přidej most ručně (údaje z BMS) nebo hromadně importem v sekci Data.</p>'}</div>`;
+  app.querySelectorAll('[data-plan]').forEach(bt => bt.onclick = async () => {
+    const b = bs.find(x => x.id === bt.dataset.plan);
+    b.plan = b.plan === today ? null : today; await put('bridges', b); route();
+  });
+}
+
+/* ---------- mapa mostů ---------- */
+function loadLeaflet() {
+  if (window.L) return Promise.resolve();
+  return new Promise((res, rej) => {
+    const l = document.createElement('link'); l.rel = 'stylesheet'; l.href = LEAF + 'leaflet.css'; document.head.appendChild(l);
+    const s = document.createElement('script'); s.src = LEAF + 'leaflet.js';
+    s.onload = res; s.onerror = () => rej(new Error('Mapu nelze načíst – chybí připojení k internetu.'));
+    document.head.appendChild(s);
+  });
+}
+async function vMap(showAll) {
+  setTitle('Mapa mostů', '#/');
+  const today = isoDay(Date.now());
+  const bs = (await all('bridges')).filter(b => b.lat != null);
+  const ins = await all('insp');
+  const planned = bs.filter(b => b.plan === today);
+  const sel = showAll ? bs : planned;
+  app.innerHTML = `
+    <div class="row" style="margin-bottom:8px">
+      <a class="btn grow${showAll ? '' : ' pri'}" href="#/mapa">Dnes (${planned.length})</a>
+      <a class="btn grow${showAll ? ' pri' : ''}" href="#/mapa/vse">Všechny (${bs.length})</a>
+    </div>
+    <div id="map" style="height:60vh;border-radius:12px;overflow:hidden;border:1px solid var(--line)"></div>
+    <div class="row" style="margin-top:8px">
+      <button class="grow" id="me">📍 Moje poloha</button>
+      <button class="grow" id="route" ${planned.length ? '' : 'disabled'}>Trasa dnešních (Google)</button>
+    </div>
+    <p class="muted">Modrá = naplánováno na dnes, zelená = dnes již založená prohlídka, šedá = ostatní. Klepnutím na bod navigace. Mapa potřebuje signál.</p>`;
+  await loadLeaflet();
+  const m = mapObj = L.map('map');
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' }).addTo(m);
+  const pts = [];
+  for (const b of sel) {
+    const done = ins.some(i => i.bridgeId === b.id && i.datum === today);
+    const col = done ? '#1e7d3c' : b.plan === today ? '#2f6fb3' : '#888';
+    L.circleMarker([b.lat, b.lon], { radius: 10, color: '#fff', weight: 2, fillColor: col, fillOpacity: 1 })
+      .addTo(m)
+      .bindTooltip(esc(b.evc), { permanent: sel.length <= 20, direction: 'top', offset: [0, -10] })
+      .bindPopup(`<b>${esc(b.evc)}</b><br>${esc(b.nazev)}<br><br>
+        <a href="https://maps.apple.com/?daddr=${b.lat},${b.lon}&dirflg=d">▶ Navigovat – Apple Mapy</a><br>
+        <a href="https://www.google.com/maps/dir/?api=1&destination=${b.lat},${b.lon}&travelmode=driving">▶ Navigovat – Google</a><br><br>
+        <a href="#/most/${b.id}">Otevřít most</a>`);
+    pts.push([b.lat, b.lon]);
+  }
+  if (pts.length) m.fitBounds(pts, { padding: [30, 30], maxZoom: 14 }); else m.setView([49.8, 15.5], 7);
+  let me = null;
+  const updMe = () => {
+    if (S.lat == null) return;
+    if (!me) me = L.circleMarker([S.lat, S.lon], { radius: 7, color: '#fff', weight: 2, fillColor: '#e53935', fillOpacity: 1 }).addTo(m).bindTooltip('já');
+    else me.setLatLng([S.lat, S.lon]);
+  };
+  mapTimer = setInterval(updMe, 2000); updMe();
+  $('#me').onclick = () => {
+    ensureSensors();
+    if (S.lat != null) m.setView([S.lat, S.lon], Math.max(m.getZoom(), 12)); else toast('Čekám na GPS…');
+  };
+  $('#route').onclick = () => {
+    // pořadí: nejbližší soused od aktuální polohy (nebo od prvního mostu)
+    let rest = [...planned], cur = S.lat != null ? [S.lat, S.lon] : [rest[0].lat, rest[0].lon];
+    const order = [];
+    while (rest.length) {
+      rest.sort((a, b) => distM(cur[0], cur[1], a.lat, a.lon) - distM(cur[0], cur[1], b.lat, b.lon));
+      const n = rest.shift(); order.push(n); cur = [n.lat, n.lon];
+    }
+    if (order.length > 10) toast('Google přijme max. 10 zastávek – použito prvních 10.', 4000);
+    const o = order.slice(0, 10), last = o.pop();
+    const wp = o.map(b => `${b.lat},${b.lon}`).join('|');
+    location.href = `https://www.google.com/maps/dir/?api=1&destination=${last.lat},${last.lon}${wp ? '&waypoints=' + encodeURIComponent(wp) : ''}&travelmode=driving`;
+  };
 }
 
 /* ---------- most: editace ---------- */
@@ -361,6 +481,9 @@ async function vBridge(id) {
       </div>
       <div class="row" style="margin-top:8px"><a class="btn grow" href="#/most/${id}/upravit">Upravit</a></div>
     </div>
+    ${b.prev ? `<div class="card"><h2>Minulá prohlídka z BMS</h2>
+      <p style="margin:0 0 8px">${esc(prevTitle(b.prev))}<br><span class="muted">SS ${esc((b.prev.rozhodnuti || {}).ss || '–')} · NK ${esc((b.prev.rozhodnuti || {}).nk || '–')} · závad ${b.prev.zavady.length} · fotek ${b.prev.fota.length}</span></p>
+      <a class="btn wide" href="#/minula/${id}">Zobrazit závady, popis a fotky</a></div>` : ''}
     <div class="card"><h2>Směr staničení kompasem</h2>
       <p class="muted">Postav se na most, namiř zadní stranu telefonu ve směru staničení a stiskni Uložit. Slouží k automatickému určení „zleva / zprava / po směru“ u fotek.</p>
       <div class="row"><span class="grow" id="hud-sens">senzory vypnuty</span><button id="sens">Zapnout</button><button class="pri" id="setaz">Uložit</button></div>
@@ -409,6 +532,10 @@ async function vInsp(id) {
       <div class="row" style="margin-top:10px"><button class="pri grow" id="savei">Uložit údaje</button><button class="bad" id="deli">Smazat prohlídku</button></div>
     </details></div>
 
+    <div class="row" style="margin-bottom:12px">
+      <a class="btn grow" href="#/popis/${id}">Popis částí (B) ${i.casti && i.casti.length ? `<span class="badge ok">${i.casti.length}</span>` : '<span class="badge miss">prázdný</span>'}</a>
+      ${b.prev ? `<a class="btn grow" href="#/minula/${b.id}">Minulá prohlídka</a>` : ''}
+    </div>
     <div class="row" style="margin-bottom:12px">
       <a class="btn pri grow" href="${camLink('zavada')}" data-cam>📷 Závada</a>
       <a class="btn grow" href="${camLink('jine')}" data-cam>📷 Jiné foto</a>
@@ -462,6 +589,21 @@ async function vInsp(id) {
     route();
   };
 }
+/* výběr závady z minulé prohlídky → předvyplní kód a popis (případně opatření) */
+function prevDefSelect(b) {
+  if (!b || !b.prev || !b.prev.zavady.length) return '';
+  return `<label>Navázat na závadu z minulé prohlídky</label><select id="fromprev"><option value="">– nová závada –</option>${b.prev.zavady.map((z, k) => `<option value="${k}">[${esc(z.code)}${z.pozice ? ' ' + esc(z.pozice) : ''}] ${esc(z.popis.slice(0, 70))}</option>`).join('')}</select>`;
+}
+function bindPrevDef(b, withOpat) {
+  const s = document.getElementById('fromprev'); if (!s) return;
+  s.onchange = () => {
+    const z = b.prev.zavady[+s.value]; if (!z) return;
+    const c = $('#code'); if (![...c.options].some(o => o.value === z.code)) c.add(new Option(z.code, z.code));
+    c.value = z.code;
+    $('#popis').value = z.popis;
+    if (withOpat && $('#opat') && !$('#opat').value) $('#opat').value = z.opatreni.map(o => o.popis).join('\n');
+  };
+}
 function newDefect(i, code = '2.1') {
   const d = { id: uid(), n: Math.max(0, ...i.defects.map(x => x.n)) + 1, code, popis: '', opatreni: '' };
   i.defects.push(d); return d;
@@ -478,11 +620,23 @@ async function vCamera(inspId, key) {
     <div class="hud"><span class="tgt">${esc(label)}</span><span id="hud-sens"></span></div>
     <div class="bar">
       <button id="x">Zpět</button>
+      ${b.prev && b.prev.fota.length ? '<button id="prevph">Minulé</button>' : ''}
       <button id="shot" class="shutter" aria-label="Vyfotit"></button>
       <label class="btn" id="natl">Fotoaparát<input id="nat" type="file" accept="image/*" capture="environment" hidden></label>
     </div></div>`;
   hud();
   $('#x').onclick = () => { location.hash = `#/prohlidka/${inspId}`; };
+  if ($('#prevph')) $('#prevph').onclick = () => {
+    // galerie minulých fotek pro zopakování záběrů
+    const o = document.createElement('div');
+    o.style.cssText = 'position:fixed;inset:0;z-index:150;background:rgba(0,0,0,.95);overflow:auto;padding:calc(env(safe-area-inset-top) + 10px) 10px 80px';
+    o.innerHTML = `<div class="row" style="margin-bottom:8px;color:#fff"><b class="grow">${esc(prevTitle(b.prev))}</b><button id="pclose">Zavřít</button></div>
+      <div class="grid">${b.prev.fota.filter(f => f.blob).map(f => `<a class="thumb" href="#" data-big="${f.poradi}"><img loading="lazy" src="${blobUrl(f.blob)}" alt=""><span class="n">${f.poradi}</span><span class="cap">${esc(capClean(f.popis))}</span></a>`).join('')}</div>`;
+    document.body.appendChild(o);
+    o.querySelector('#pclose').onclick = () => o.remove();
+    bindBig(o, b.prev.fota);
+    window.addEventListener('hashchange', () => o.remove(), { once: true });
+  };
   let metaNat = null;
   $('#natl').addEventListener('click', () => { metaNat = snap(); metaNat.src = 'fotoaparat'; });
   $('#nat').onchange = async e => {
@@ -535,6 +689,7 @@ async function vPhoto(id, fromCam) {
       <div id="defbox" ${isDef ? '' : 'hidden'}>
         <label>Závada</label><select id="def"><option value="">+ nová závada</option>${i.defects.map(d => `<option value="${d.id}"${d.id === p.defectId ? ' selected' : ''}>č. ${d.n} [${esc(d.code)}] ${esc(d.popis.slice(0, 40))}</option>`).join('')}</select>
         <div id="newdef" ${p.defectId ? 'hidden' : ''}>
+          ${prevDefSelect(b)}
           <label>Část mostu (kód BMS)</label><select id="code">${CODES.map(([c, n]) => `<option value="${c}">${c} ${esc(n)}</option>`).join('')}</select>
           <label>Popis závady (diktuj mikrofonem na klávesnici)</label><textarea id="popis" placeholder="např. Podélná trhlina šířky cca 0,3 mm na podhledu NK v poli 2, délka cca 1,5 m."></textarea>
         </div>
@@ -564,6 +719,7 @@ async function vPhoto(id, fromCam) {
   $('#cap').addEventListener('input', () => { $('#cap').dataset.auto = '0'; });
   $('#key').onchange = syncKey;
   $('#def').onchange = () => { $('#newdef').hidden = !!$('#def').value; };
+  bindPrevDef(b);
   let audio = p.audio, chunks = [];
   $('#rec').onclick = async () => {
     if (recorder && recorder.state === 'recording') { recorder.stop(); return; }
@@ -609,13 +765,16 @@ async function vDefect(inspId, defId) {
   if (!d) { location.hash = `#/prohlidka/${inspId}`; return; }
   const ph = (await photosOf(inspId)).filter(p => p.defectId === defId).sort((a, b) => a.seq - b.seq);
   setTitle(`Závada č. ${d.n}`, `#/prohlidka/${inspId}`);
+  const b = await get('bridges', i.bridgeId);
   app.innerHTML = `<div class="card">
+    ${prevDefSelect(b)}
     <label>Část mostu (kód BMS)</label><select id="code">${CODES.map(([c, n]) => `<option value="${c}"${c === d.code ? ' selected' : ''}>${c} ${esc(n)}</option>`).join('')}</select>
     <label>Popis závady</label><textarea id="popis">${esc(d.popis)}</textarea>
     <label>Návrh opatření</label><textarea id="opat">${esc(d.opatreni)}</textarea>
     <div class="row" style="margin-top:12px"><button class="pri grow" id="save">Uložit</button><a class="btn" href="#/kamera/${inspId}?k=zavada" id="foto">📷 Přidat foto</a></div>
     <button class="bad wide" id="deld" style="margin-top:8px">Smazat závadu</button></div>
     <div class="card"><h2>Fotky (${ph.length})</h2><div class="grid">${ph.map(p => `<a class="thumb" href="#/foto/${p.id}"><img src="${blobUrl(p.blob)}" alt=""><span class="n">${p.seq}</span></a>`).join('')}</div></div>`;
+  bindPrevDef(b, true);
   const save = async () => { d.code = $('#code').value; d.popis = $('#popis').value.trim(); d.opatreni = $('#opat').value.trim(); await put('insp', i); };
   $('#save').onclick = async () => { await save(); location.hash = `#/prohlidka/${inspId}`; };
   $('#foto').addEventListener('click', async ev => { ensureSensors(); await save(); });
@@ -661,6 +820,9 @@ async function buildExport(i, b, ph) {
   L.push(`Způsob zpřístupnění: ${i.zpristupneni || '[doplnit]'}`);
   L.push(`Teplota vzduchu: ${i.tVzd !== '' ? i.tVzd + ' °C' : '[doplnit]'}    Teplota NK: ${i.tNK !== '' ? i.tNK + ' °C' : '[doplnit]'}`);
   if (b.smer) L.push(`Staničení ve směru: ${b.smer}`);
+  L.push('', 'B. POPIS ČÁSTÍ MOSTU');
+  if (i.casti && i.casti.length) i.casti.forEach(c => L.push('', `[${c.code}] ${c.nazev || codeName(c.code)}${c.pozice ? ' – ' + c.pozice : ''}`, c.popis || '[doplnit]'));
+  else L.push('[doplnit]');
   L.push('', 'C. STAV A ZÁVADY ČÁSTÍ MOSTU');
   const byCode = {};
   [...i.defects].sort((a, c) => a.code.localeCompare(c.code, 'cs', { numeric: true }) || a.n - c.n).forEach(d => { (byCode[d.code] = byCode[d.code] || []).push(d); });
@@ -697,6 +859,11 @@ async function vData() {
   try { const e = await navigator.storage.estimate(); est = `${num(e.usage / 1048576, 1)} MB z ${num(e.quota / 1048576, 0)} MB`; } catch (e) { /* */ }
   const pers = navigator.storage && navigator.storage.persisted ? await navigator.storage.persisted() : false;
   app.innerHTML = `
+    <div class="card"><h2>Import balíčku z BMS</h2>
+      <p class="muted">Soubor <code>balicek_….json</code> ze záložky „Balíček z BMS“ (návod na stránce <a href="bms.html">bms.html</a>). Doplní souřadnice, počet polí, směr staničení a poslední hlavní prohlídku vč. náhledů fotek. Mosty se párují podle ev. č.</p>
+      <label class="btn pri wide">Vybrat balíček…<input type="file" id="pkg" accept=".json,application/json" hidden></label>
+      <p class="muted" id="pkgst"></p>
+    </div>
     <div class="card"><h2>Import mostů (CSV)</h2>
       <p class="muted">Řádek: <code>ev.č.;název;šířka;délka;počet polí;staničení ve směru</code>. Oddělovač středník, desetinná čárka i tečka. Existující ev. č. se aktualizuje.</p>
       <textarea id="csv" placeholder="118-039;Most přes potok Čeperka u osady Nouzov;50,1234;14,0567;1;Nouzov → Kladno"></textarea>
@@ -725,6 +892,17 @@ async function vData() {
     for (const b of bs.filter(x => x._dirty)) { delete b._dirty; await put('bridges', b); }
     toast(`Importováno ${n}${bad.length ? ', chybné řádky: ' + bad.join(', ') : ''}`, 5000);
   };
+  $('#pkg').onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    const st = $('#pkgst');
+    try {
+      st.textContent = 'Načítám…';
+      const j = JSON.parse(await f.text());
+      if (j.format !== 'prohlidky-balicek') throw new Error('Není to balíček z BMS.');
+      const r = await importPackage(j, t => { st.textContent = t; });
+      toast(r, 5000); st.textContent = r;
+    } catch (err) { st.textContent = 'Chyba: ' + err.message; }
+  };
   $('#imp').onclick = () => doImport($('#csv').value);
   $('#csvf').onchange = async e => { const f = e.target.files[0]; if (f) doImport(await f.text()); };
   $('#bk').onclick = async () => {
@@ -733,6 +911,105 @@ async function vData() {
     saveFile(new Blob(['﻿' + t], { type: 'text/csv' }), `mosty_${isoDay(Date.now())}.csv`);
   };
   if (!pers && $('#persist')) $('#persist').onclick = async () => { const r = navigator.storage.persist ? await navigator.storage.persist() : false; toast(r ? 'Úložiště je trvalé' : 'Systém trvalé úložiště nepovolil'); route(); };
+}
+
+/* ---------- balíček z BMS ---------- */
+async function importPackage(j, progress) {
+  const bs = await all('bridges'); let nNew = 0, nUpd = 0, nPh = 0;
+  for (const [k, m] of (j.mosty || []).entries()) {
+    progress && progress(`${k + 1}/${j.mosty.length} ${m.evc}`);
+    let b = bs.find(x => normEvc(x.evc) === normEvc(m.evc));
+    if (!b) { b = { id: uid(), evc: m.evc, az: null, pozn: '', plan: null }; bs.push(b); nNew++; } else nUpd++;
+    b.nazev = m.nazev || b.nazev || '';
+    if (m.jtsk && m.jtsk.x && m.jtsk.y) { const w = jtsk2wgs(m.jtsk.x, m.jtsk.y); b.lat = +w.lat.toFixed(6); b.lon = +w.lon.toFixed(6); }
+    if (m.poli) b.poli = m.poli;
+    if (m.smer) b.smer = m.smer;
+    if (m.staniceni != null) b.staniceni = m.staniceni;
+    b.bmsGuid = m.guid;
+    if (m.prohlidka) {
+      const p = m.prohlidka;
+      const fota = [];
+      for (const f of p.fota || []) { fota.push({ poradi: f.poradi, popis: f.popis, blob: await dataUrlToBlob(f.img) }); nPh++; }
+      b.prev = { ...p, fota, importovano: Date.now() };
+    }
+    await put('bridges', b);
+  }
+  return `Import hotov: nových ${nNew}, aktualizovaných ${nUpd}, fotek ${nPh}.`;
+}
+const prevTitle = p => `${p.kod || p.druh} ${fmtDate(p.datum)}${p.prohlizel ? ', ' + p.prohlizel : ''}`;
+const capClean = s => String(s || '').replace(/\.(jpe?g|png)$/i, '').replace(/^\d+[_\s-]*/, '');
+
+/* minulá prohlídka */
+async function vPrev(id) {
+  const b = await get('bridges', id);
+  if (!b || !b.prev) { location.hash = `#/most/${id}`; return; }
+  const p = b.prev, ro = p.rozhodnuti || {};
+  setTitle(`${b.evc} – minulá prohlídka`, `#/most/${id}`);
+  const fBy = n => p.fota.find(f => f.poradi === n);
+  const th = f => f && f.blob ? `<a class="thumb" href="#" data-big="${f.poradi}"><img loading="lazy" src="${blobUrl(f.blob)}" alt=""><span class="n">${f.poradi}</span></a>` : '';
+  app.innerHTML = `
+    <div class="card"><h2>${esc(prevTitle(p))}</h2>
+      <div class="kv">
+        <b>Spodní stavba</b><span>${esc(ro.ss || '–')}</span>
+        <b>Nosná konstrukce</b><span>${esc(ro.nk || '–')}</span>
+        <b>Použitelnost</b><span>${esc(ro.pouzitelnost || '–')}</span>
+        <b>Vn / Vr / Ve</b><span>${num(ro.vn, 1)} / ${num(ro.vr, 0)} / ${num(ro.ve, 0)} t</span>
+        <b>Staničení ve směru</b><span>${esc(b.smer || '–')}</span>
+        <b>Zpřístupnění</b><span>${esc(p.zpristupneni || '–')}</span>
+      </div></div>
+    <div class="card"><h2>Závady (${p.zavady.length})</h2>
+      <ul class="list">${p.zavady.map(z => `<li style="display:block">
+        <div><b>[${esc(z.code)}] ${esc(codeName(z.code))}${z.pozice ? ' – ' + esc(z.pozice) : ''}</b> ${z.stav ? `<span class="badge">${esc(z.stav)}</span>` : ''}</div>
+        <div style="white-space:pre-wrap">${esc(z.popis)}</div>
+        ${z.opatreni.map(o => `<div class="muted">➜ ${esc(o.popis)} ${o.nalehavost ? '(' + esc(o.nalehavost) + ')' : ''}</div>`).join('')}
+        ${z.fota.length ? `<div class="grid" style="margin-top:6px">${z.fota.map(n => th(fBy(n))).join('')}</div>` : ''}
+      </li>`).join('') || '<li class="muted">Bez závad.</li>'}</ul></div>
+    <div class="card"><details><summary>Popis částí mostu (${p.casti.length})</summary>
+      ${p.casti.map(c => `<p><b>[${esc(c.code)}] ${esc(c.nazev)}${c.pozice ? ' – ' + esc(c.pozice) : ''}</b><br><span style="white-space:pre-wrap">${esc(c.popis) || '–'}</span></p>`).join('')}
+    </details></div>
+    <div class="card"><h2>Fotky (${p.fota.length})</h2>
+      <div class="grid">${p.fota.map(f => f.blob ? `<a class="thumb" href="#" data-big="${f.poradi}"><img loading="lazy" src="${blobUrl(f.blob)}" alt=""><span class="n">${f.poradi}</span><span class="cap">${esc(capClean(f.popis))}</span></a>` : '').join('')}</div>
+    </div>`;
+  bindBig(app, p.fota);
+}
+function bindBig(root, fota) {
+  root.querySelectorAll('[data-big]').forEach(a => a.onclick = ev => {
+    ev.preventDefault();
+    const f = fota.find(x => String(x.poradi) === a.dataset.big);
+    if (f && f.blob) showBig(blobUrl(f.blob), `${f.poradi}: ${capClean(f.popis)}`);
+  });
+}
+
+/* popis částí mostu (oddíl B) pro novou prohlídku */
+async function vDesc(inspId) {
+  const i = await get('insp', inspId), b = await get('bridges', i.bridgeId);
+  setTitle('Popis částí mostu', `#/prohlidka/${inspId}`);
+  if (!i.casti) i.casti = [];
+  app.innerHTML = `
+    <div class="card">
+      <p class="muted">Oddíl B zprávy. ${b.prev ? `Převzít lze z ${esc(prevTitle(b.prev))}.` : 'Minulá prohlídka není importovaná (Data → Import balíčku z BMS).'}</p>
+      <div class="row">${b.prev ? '<button class="grow" id="take">Převzít z minulé prohlídky</button>' : ''}<button class="grow" id="add">+ Část</button></div>
+    </div>
+    ${i.casti.map((c, k) => `<div class="card">
+      <div class="row"><select class="grow" data-code="${k}">${CODES.map(([cd, n]) => `<option value="${cd}"${cd === c.code ? ' selected' : ''}>${cd} ${esc(n)}</option>`).join('')}${CODES.some(x => x[0] === c.code) ? '' : `<option selected value="${esc(c.code)}">${esc(c.code)} ${esc(c.nazev)}</option>`}</select>
+      <button class="small bad" data-del="${k}">✕</button></div>
+      <input data-poz="${k}" placeholder="pozice (např. Opěry)" value="${esc(c.pozice)}" style="margin-top:6px">
+      <textarea data-pop="${k}" style="margin-top:6px;min-height:110px">${esc(c.popis)}</textarea>
+    </div>`).join('')}
+    ${i.casti.length ? '<button class="pri wide" id="save">Uložit</button>' : ''}`;
+  const collect = () => {
+    i.casti.forEach((c, k) => {
+      c.code = app.querySelector(`[data-code="${k}"]`).value; c.nazev = codeName(c.code) || c.nazev;
+      c.pozice = app.querySelector(`[data-poz="${k}"]`).value.trim(); c.popis = app.querySelector(`[data-pop="${k}"]`).value.trim();
+    });
+  };
+  if ($('#take')) $('#take').onclick = async () => {
+    if (i.casti.length && !confirm('Přepsat současný popis popisem z minulé prohlídky?')) return;
+    i.casti = b.prev.casti.map(c => ({ ...c })); await put('insp', i); route();
+  };
+  $('#add').onclick = async () => { collect(); i.casti.push({ code: '2.1', nazev: codeName('2.1'), pozice: '', popis: '' }); await put('insp', i); route(); };
+  app.querySelectorAll('[data-del]').forEach(bt => bt.onclick = async () => { collect(); i.casti.splice(+bt.dataset.del, 1); await put('insp', i); route(); });
+  if ($('#save')) $('#save').onclick = async () => { collect(); await put('insp', i); toast('Uloženo'); location.hash = `#/prohlidka/${inspId}`; };
 }
 
 /* ---------- start ---------- */

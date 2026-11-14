@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Záložka pro BMS</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="top"><h1>Záložka „Balíček z BMS“</h1></header>
+<main>
+  <div class="card">
+    <h2>1. Instalace (jednou, na PC)</h2>
+    <p>Přetáhni tlačítko níže myší na <b>lištu záložek</b> prohlížeče (Chrome/Edge: lištu zapneš Ctrl+Shift+B).</p>
+    <p><a class="btn pri" id="bm" href="#">⬇ Balíček z BMS</a></p>
+    <p class="muted" id="st">Načítám…</p>
+  </div>
+  <div class="card">
+    <h2>2. Použití</h2>
+    <ol>
+      <li>Přihlas se do <b>bms.clevera.cz</b>.</li>
+      <li>Klikni na záložku „Balíček z BMS“ a zadej ev. č. mostů, např. <code>605-026, 23617-1</code>.</li>
+      <li>Stáhne se soubor <code>balicek_RRRR-MM-DD.json</code> (karta mostu, poslední hlavní prohlídka, náhledy fotek).</li>
+      <li>Soubor přenes do iPhonu (OneDrive, e-mail sobě, AirDrop z Macu…) a v aplikaci otevři <b>Data → Import balíčku z BMS</b>.</li>
+    </ol>
+    <p class="muted">Záložka v BMS pouze čte data pod tvým přihlášením, nic neukládá ani neodesílá jinam. Využívá neveřejné rozhraní BMS – při změně na straně Clevery může přestat fungovat.</p>
+  </div>
+</main>
+<script>
+fetch('bms-balicek.js').then(r => r.text()).then(t => {
+  document.getElementById('bm').href = 'javascript:' + encodeURIComponent(t.replace(/^\s*\/\*[\s\S]*?\*\/\s*/, ''));
+  document.getElementById('st').textContent = 'Připraveno. Kliknutí na tlačítko zde nic nedělá – je potřeba ho přetáhnout do záložek.';
+}).catch(() => { document.getElementById('st').textContent = 'Chyba načtení bms-balicek.js'; });
+document.getElementById('bm').addEventListener('click', e => e.preventDefault());
+</script>
+</body>
+</html>

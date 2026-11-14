@@ -1,5 +1,6 @@
 // Offline cache aplikace. Při změně souborů zvýšit verzi.
-const CACHE = 'prohlidky-v0.1.0';
+const CACHE = 'prohlidky-v0.3.0';
+const LIB = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/';
 const FILES = ['./', 'index.html', 'app.js', 'style.css', 'manifest.webmanifest', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
 self.addEventListener('activate', e => {
@@ -8,7 +9,14 @@ self.addEventListener('activate', e => {
 });
 // síť první (aktualizace), při výpadku cache
 self.addEventListener('fetch', e => {
-  if (e.request.method !== 'GET' || new URL(e.request.url).origin !== location.origin) return;
+  if (e.request.method !== 'GET') return;
+  if (e.request.url.startsWith(LIB)) { // knihovna mapy: cache první
+    e.respondWith(caches.match(e.request).then(m => m || fetch(e.request).then(r => {
+      const copy = r.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)); return r;
+    })));
+    return;
+  }
+  if (new URL(e.request.url).origin !== location.origin) return;
   e.respondWith(fetch(e.request).then(r => {
     const copy = r.clone(); caches.open(CACHE).then(c => c.put(e.request, copy)); return r;
   }).catch(() => caches.match(e.request, { ignoreSearch: true })));
