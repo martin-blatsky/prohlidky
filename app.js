@@ -1,7 +1,7 @@
 'use strict';
 /* Prohlídky mostů – PWA pro sběr fotodokumentace a závad v terénu.
    Data zůstávají v zařízení (IndexedDB), ven jen přes export ZIP. */
-const APP_VERSION = '0.3.0';
+const APP_VERSION = '0.4.0';
 const LEAF = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/';
 const MAXPX = 2048;          // delší strana zmenšené fotky [px]
 const TARGET = 550 * 1024;   // cílová velikost JPEG [B]
@@ -717,6 +717,8 @@ async function vPhoto(id, fromCam) {
     if (it && (!$('#cap').value.trim() || $('#cap').dataset.auto !== '0')) $('#cap').value = defaultCaption(it, p.dir);
   };
   $('#cap').addEventListener('input', () => { $('#cap').dataset.auto = '0'; });
+  Diktat.attach($('#cap'), 'cap');
+  Diktat.attach($('#popis'), 'def', () => $('#code').value);
   $('#key').onchange = syncKey;
   $('#def').onchange = () => { $('#newdef').hidden = !!$('#def').value; };
   bindPrevDef(b);
@@ -746,11 +748,13 @@ async function vPhoto(id, fromCam) {
       if (!d) {
         d = newDefect(i2, $('#code').value); d.popis = $('#popis').value.trim();
         await put('insp', i2);
+        Diktat.learn('def', d.code, d.popis);
       }
       p.defectId = d.id;
       if (!p.caption) p.caption = `Závada č. ${d.n}${d.popis ? ' – ' + d.popis.split(/[.,;]/)[0] : ''}.`;
     } else p.defectId = null;
     await put('photos', p);
+    if ($('#cap').dataset.auto === '0') Diktat.learn('cap', '', p.caption); // jen ručně upravené popisky
     return i2;
   };
   if (fromCam) $('#savenext').onclick = async () => { await save(); location.hash = `#/kamera/${p.inspId}?k=${encodeURIComponent(p.key)}`; };
@@ -775,7 +779,12 @@ async function vDefect(inspId, defId) {
     <button class="bad wide" id="deld" style="margin-top:8px">Smazat závadu</button></div>
     <div class="card"><h2>Fotky (${ph.length})</h2><div class="grid">${ph.map(p => `<a class="thumb" href="#/foto/${p.id}"><img src="${blobUrl(p.blob)}" alt=""><span class="n">${p.seq}</span></a>`).join('')}</div></div>`;
   bindPrevDef(b, true);
-  const save = async () => { d.code = $('#code').value; d.popis = $('#popis').value.trim(); d.opatreni = $('#opat').value.trim(); await put('insp', i); };
+  Diktat.attach($('#popis'), 'def', () => $('#code').value);
+  Diktat.attach($('#opat'), 'opt', () => $('#code').value);
+  const save = async () => {
+    d.code = $('#code').value; d.popis = $('#popis').value.trim(); d.opatreni = $('#opat').value.trim(); await put('insp', i);
+    Diktat.learn('def', d.code, d.popis); Diktat.learn('opt', d.code, d.opatreni);
+  };
   $('#save').onclick = async () => { await save(); location.hash = `#/prohlidka/${inspId}`; };
   $('#foto').addEventListener('click', async ev => { ensureSensors(); await save(); });
   $('#deld').onclick = async () => {
@@ -872,6 +881,13 @@ async function vData() {
     <div class="card"><h2>Záloha seznamu mostů</h2>
       <button class="wide" id="bk">Exportovat mosty (CSV)</button>
     </div>
+    <div class="card"><h2>Slovník diktátu</h2>
+      <p class="muted">${(st => `Základ ${st.base} slov ze vzorových HPM, naučeno ${st.learned} slov a ${st.phrases} frází, vlastních oprav ${st.fix}.`)(Diktat.stats())}
+        Vlastní opravy: jeden řádek <code>co diktát napíše = co má být</code>, např. <code>lůžko = ložisko</code>.</p>
+      <textarea id="fixes" placeholder="lůžko = ložisko&#10;výluky = výluhy">${esc(Diktat.getFix())}</textarea>
+      <div class="row" style="margin-top:8px"><button class="pri grow" id="fixsave">Uložit opravy</button><button id="dexp">Export</button><label class="btn">Import<input type="file" id="dimp" accept=".json" hidden></label></div>
+      <button class="wide bad" id="dreset" style="margin-top:8px">Zapomenout naučené</button>
+    </div>
     <div class="card"><h2>Úložiště</h2>
       <div class="kv"><b>Využito</b><span>${est || '–'}</span><b>Trvalé</b><span>${pers ? 'ano' : 'ne'}</span><b>Verze</b><span>${APP_VERSION}</span></div>
       <p class="muted">Fotky jsou jen v tomto telefonu. Po každé prohlídce udělej export ZIP.</p>
@@ -903,6 +919,10 @@ async function vData() {
       toast(r, 5000); st.textContent = r;
     } catch (err) { st.textContent = 'Chyba: ' + err.message; }
   };
+  $('#fixsave').onclick = () => { Diktat.setFix($('#fixes').value); toast('Opravy uloženy'); route(); };
+  $('#dexp').onclick = () => saveFile(new Blob([Diktat.exportJson()], { type: 'application/json' }), `slovnik_${isoDay(Date.now())}.json`);
+  $('#dimp').onchange = async e => { const f = e.target.files[0]; if (!f) return; try { Diktat.importJson(await f.text()); toast('Slovník sloučen'); route(); } catch (err) { toast('Chyba: ' + err.message, 4000); } };
+  $('#dreset').onclick = () => { if (confirm('Zapomenout naučená slova a fráze? Vlastní opravy zůstanou.')) { Diktat.reset(); route(); } };
   $('#imp').onclick = () => doImport($('#csv').value);
   $('#csvf').onchange = async e => { const f = e.target.files[0]; if (f) doImport(await f.text()); };
   $('#bk').onclick = async () => {
@@ -931,6 +951,7 @@ async function importPackage(j, progress) {
       const fota = [];
       for (const f of p.fota || []) { fota.push({ poradi: f.poradi, popis: f.popis, blob: await dataUrlToBlob(f.img) }); nPh++; }
       b.prev = { ...p, fota, importovano: Date.now() };
+      Diktat.learnPrev(p);
     }
     await put('bridges', b);
   }
@@ -1009,7 +1030,8 @@ async function vDesc(inspId) {
   };
   $('#add').onclick = async () => { collect(); i.casti.push({ code: '2.1', nazev: codeName('2.1'), pozice: '', popis: '' }); await put('insp', i); route(); };
   app.querySelectorAll('[data-del]').forEach(bt => bt.onclick = async () => { collect(); i.casti.splice(+bt.dataset.del, 1); await put('insp', i); route(); });
-  if ($('#save')) $('#save').onclick = async () => { collect(); await put('insp', i); toast('Uloženo'); location.hash = `#/prohlidka/${inspId}`; };
+  app.querySelectorAll('[data-pop]').forEach(t => Diktat.attach(t, 'desc', () => app.querySelector(`[data-code="${t.dataset.pop}"]`).value));
+  if ($('#save')) $('#save').onclick = async () => { collect(); await put('insp', i); i.casti.forEach(c => Diktat.learn('desc', c.code, c.popis)); toast('Uloženo'); location.hash = `#/prohlidka/${inspId}`; };
 }
 
 /* ---------- start ---------- */
