@@ -1,7 +1,7 @@
 'use strict';
 /* Prohlídky mostů – PWA pro sběr fotodokumentace a závad v terénu.
    Data zůstávají v zařízení (IndexedDB), ven jen přes export ZIP. */
-const APP_VERSION = '0.5.0';
+const APP_VERSION = '0.5.1';
 const LEAF = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/';
 const MAXPX = 2048;          // delší strana zmenšené fotky [px]
 const TARGET = 550 * 1024;   // cílová velikost JPEG [B]
@@ -380,8 +380,9 @@ async function vMap(showAll) {
     <div id="map" style="height:60vh;border-radius:12px;overflow:hidden;border:1px solid var(--line)"></div>
     <div class="row" style="margin-top:8px">
       <button class="grow" id="me">📍 Moje poloha</button>
-      <button class="grow" id="route" ${planned.length ? '' : 'disabled'}>Trasa dnešních (Google)</button>
+      <button class="grow" id="route" ${planned.length ? '' : 'disabled'}>Trasa po dnešních mostech</button>
     </div>
+    <div id="routebox"></div>
     <p class="muted">Modrá = naplánováno na dnes, zelená = dnes již založená prohlídka, šedá = ostatní. Klepnutím na bod navigace. Mapa potřebuje signál.</p>`;
   await loadLeaflet();
   const m = mapObj = L.map('map');
@@ -412,17 +413,37 @@ async function vMap(showAll) {
     if (S.lat != null) m.setView([S.lat, S.lon], Math.max(m.getZoom(), 12)); else toast('Čekám na GPS…');
   };
   $('#route').onclick = () => {
-    // pořadí: nejbližší soused od aktuální polohy (nebo od prvního mostu)
-    let rest = [...planned], cur = S.lat != null ? [S.lat, S.lon] : [rest[0].lat, rest[0].lon];
+    ensureSensors();
+    const me = S.lat != null ? [S.lat, S.lon] : null;
+    // pořadí: nejbližší soused od aktuální polohy (bez GPS od nejzápadnějšího mostu)
+    let rest = [...planned];
+    let cur = me || (rest.sort((a, b) => a.lon - b.lon), [rest[0].lat, rest[0].lon]);
     const order = [];
     while (rest.length) {
       rest.sort((a, b) => distM(cur[0], cur[1], a.lat, a.lon) - distM(cur[0], cur[1], b.lat, b.lon));
       const n = rest.shift(); order.push(n); cur = [n.lat, n.lon];
     }
-    if (order.length > 10) toast('Google přijme max. 10 zastávek – použito prvních 10.', 4000);
-    const o = order.slice(0, 10), last = o.pop();
-    const wp = o.map(b => `${b.lat},${b.lon}`).join('|');
-    location.href = `https://www.google.com/maps/dir/?api=1&destination=${last.lat},${last.lon}${wp ? '&waypoints=' + encodeURIComponent(wp) : ''}&travelmode=driving`;
+    const ll = b => `${b.lat},${b.lon}`, lonlat = b => `${b.lon},${b.lat}`;
+    // Mapy.com: start, cíl a max. 15 průjezdních bodů (formát délka,šířka; oddělovač „;“)
+    const mStart = me ? `${me[1]},${me[0]}` : lonlat(order[0]);
+    const mPts = me ? order : order.slice(1);
+    const mapy = mPts.length ? `https://mapy.com/fnc/v1/route?mapset=traffic&routeType=car_fast_traffic&start=${mStart}&end=${lonlat(mPts[mPts.length - 1])}` +
+      (mPts.length > 1 ? `&waypoints=${mPts.slice(0, -1).slice(0, 15).map(lonlat).join(';')}` : '') : '';
+    // Google na mobilu přijme jen 3 průjezdní body → úseky po 4 mostech
+    const legs = [];
+    for (let k = 0; k < order.length; k += 4) {
+      const part = order.slice(k, k + 4), last = part[part.length - 1], wp = part.slice(0, -1).map(ll).join('|');
+      const origin = k ? `&origin=${ll(order[k - 1])}` : '';
+      legs.push({ from: k + 1, to: k + part.length, url: `https://www.google.com/maps/dir/?api=1${origin}&destination=${ll(last)}${wp ? '&waypoints=' + encodeURIComponent(wp) : ''}&travelmode=driving` });
+    }
+    const ext = 'target="_blank" rel="noopener"';
+    $('#routebox').innerHTML = `<div class="card" style="margin-top:8px"><h2>Trasa po dnešních mostech (${order.length})</h2>
+      <p class="muted" style="margin-top:0">Pořadí podle nejbližšího dalšího mostu ${me ? 'od tvé polohy' : '(bez GPS – od nejzápadnějšího mostu)'}.</p>
+      <ol style="margin:0 0 10px;padding-left:22px">${order.map(b => `<li><b>${esc(b.evc)}</b> ${esc(b.nazev)}</li>`).join('')}</ol>
+      ${mapy ? `<a class="btn pri wide" ${ext} href="${mapy}">▶ Celá trasa – Mapy.com</a>${order.length > 16 ? '<p class="muted">Mapy.com vezmou nejvýš 15 průjezdních bodů, další mosty doplň ručně.</p>' : ''}` : ''}
+      <div class="row" style="margin-top:8px">${legs.map(l => `<a class="btn grow" ${ext} href="${l.url}">Google${legs.length > 1 ? ` – mosty ${l.from}–${l.to}` : ''}</a>`).join('')}</div>
+      <p class="muted">Google na mobilu přijme jen 3 průjezdní body, proto je trasa rozdělená na úseky. Apple Mapy více zastávek přes odkaz neumí – navigace k jednotlivému mostu je v jeho bublině na mapě.</p></div>`;
+    $('#routebox').scrollIntoView({ behavior: 'smooth' });
   };
 }
 
