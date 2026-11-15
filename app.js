@@ -1,7 +1,7 @@
 'use strict';
 /* Prohlídky mostů – PWA pro sběr fotodokumentace a závad v terénu.
    Data zůstávají v zařízení (IndexedDB), ven jen přes export ZIP. */
-const APP_VERSION = '0.5.1';
+const APP_VERSION = '0.5.2';
 const LEAF = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/';
 const MAXPX = 2048;          // delší strana zmenšené fotky [px]
 const TARGET = 550 * 1024;   // cílová velikost JPEG [B]
@@ -380,7 +380,7 @@ async function vMap(showAll) {
     <div id="map" style="height:60vh;border-radius:12px;overflow:hidden;border:1px solid var(--line)"></div>
     <div class="row" style="margin-top:8px">
       <button class="grow" id="me">📍 Moje poloha</button>
-      <button class="grow" id="route" ${planned.length ? '' : 'disabled'}>Trasa po dnešních mostech</button>
+      <button class="grow${planned.length ? ' pri' : ''}" id="route">Trasa po dnešních mostech</button>
     </div>
     <div id="routebox"></div>
     <p class="muted">Modrá = naplánováno na dnes, zelená = dnes již založená prohlídka, šedá = ostatní. Klepnutím na bod navigace. Mapa potřebuje signál.</p>`;
@@ -413,6 +413,13 @@ async function vMap(showAll) {
     if (S.lat != null) m.setView([S.lat, S.lon], Math.max(m.getZoom(), 12)); else toast('Čekám na GPS…');
   };
   $('#route').onclick = () => {
+    if (!planned.length) {
+      const old = (bs.filter(b => b.plan && b.plan < today)).length;
+      $('#routebox').innerHTML = `<div class="card" style="margin-top:8px"><b>Na dnešek není naplánovaný žádný most.</b>
+        <p class="muted" style="margin-bottom:0">V seznamu mostů klepni u mostů, kam dnes jedeš, na „dnes“.${old ? ` ${old} most(y) mají označení z dřívějšího dne – to platí jen pro ten den.` : ''}</p></div>`;
+      $('#routebox').scrollIntoView({ behavior: 'smooth' });
+      return;
+    }
     ensureSensors();
     const me = S.lat != null ? [S.lat, S.lon] : null;
     // pořadí: nejbližší soused od aktuální polohy (bez GPS od nejzápadnějšího mostu)
