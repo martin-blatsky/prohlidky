@@ -1,7 +1,7 @@
 'use strict';
 /* Prohlídky mostů – PWA pro sběr fotodokumentace a závad v terénu.
    Data zůstávají v zařízení (IndexedDB), ven jen přes export ZIP. */
-const APP_VERSION = '0.6.2';
+const APP_VERSION = '0.7.0';
 const LEAF = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/';
 const MAXPX = 2048;          // delší strana zmenšené fotky [px]
 const TARGET = 550 * 1024;   // cílová velikost JPEG [B]
@@ -214,18 +214,41 @@ function distM(a, b, c, d) {
 
 /* ---------- senzory: GPS + kompas ---------- */
 const S = { on: false, heading: null, lat: null, lon: null, acc: null, t: 0 };
+/* Azimut osy zadní kamery z absolutní orientace (Android; alpha/beta/gamma dle W3C, rotace Z-X'-Y'').
+   Zadní kamera míří po ose −z zařízení: v = Rz(α)·Rx(β)·Ry(γ)·(0,0,−1); azimut = atan2(v_východ, v_sever).
+   Když telefon leží skoro vodorovně (kamera míří do země / k nebi), použije se směr horní hrany telefonu. */
+function camHeading(alpha, beta, gamma) {
+  const r = Math.PI / 180, cA = Math.cos(alpha * r), sA = Math.sin(alpha * r), cB = Math.cos(beta * r), sB = Math.sin(beta * r),
+    cG = Math.cos(gamma * r), sG = Math.sin(gamma * r);
+  let x = -cA * sG - sA * sB * cG, y = -sA * sG + cA * sB * cG;           // vodorovný průmět osy kamery
+  if (Math.hypot(x, y) < 0.35) { x = -sA * cB; y = cA * cB; }              // telefon naplocho → horní hrana
+  return ((Math.atan2(x, y) / r) % 360 + 360) % 360;
+}
+/* vyhlazení (senzory Androidu kolísají) – průměrování na kružnici */
+function smoothHeading(prev, h, k = 0.3) {
+  if (prev == null) return h;
+  const r = Math.PI / 180, x = (1 - k) * Math.sin(prev * r) + k * Math.sin(h * r), y = (1 - k) * Math.cos(prev * r) + k * Math.cos(h * r);
+  return ((Math.atan2(x, y) / r) % 360 + 360) % 360;
+}
 function ensureSensors() {
   if (S.on) return;
   S.on = true;
+  const hasAbs = 'ondeviceorientationabsolute' in window;               // Android Chrome
+  const onAbs = e => {
+    if (e.alpha == null || e.beta == null || e.gamma == null) return;
+    const h = camHeading(e.alpha, e.beta, e.gamma);
+    S.heading = smoothHeading(S.heading, h); S.hsrc = 'android'; hud();
+  };
   const listen = () => {
+    if (hasAbs) window.addEventListener('deviceorientationabsolute', onAbs, true);
     window.addEventListener('deviceorientation', e => {
-      if (e.webkitCompassHeading != null) S.heading = e.webkitCompassHeading;       // iOS
-      else if (e.absolute && e.alpha != null) S.heading = (360 - e.alpha) % 360;
-      hud();
+      if (e.webkitCompassHeading != null) { S.heading = e.webkitCompassHeading; S.hsrc = 'ios'; hud(); }   // iOS
+      else if (!hasAbs && e.absolute) onAbs(e);                                                      // Firefox Android aj.
     }, true);
   };
   try {
-    if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+    // povolení (requestPermission) vyžaduje iOS; Android s absolutní orientací poslouchá rovnou
+    if (!hasAbs && typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
       DeviceOrientationEvent.requestPermission().then(r => { if (r === 'granted') listen(); else toast('Kompas nepovolen'); }).catch(() => toast('Kompas nepovolen'));
     } else listen();
   } catch (e) { /* bez kompasu */ }
@@ -246,7 +269,7 @@ function hud() {
   const h = document.getElementById('hud-sens');
   if (!h) return;
   const d = hudCtx ? dirWord(S.heading, hudCtx.az) : '';
-  h.textContent = `${S.heading == null ? 'kompas –' : 'az ' + Math.round(S.heading) + '°'}${d ? ' · ' + d : ''} · ${S.acc == null ? 'GPS –' : 'GPS ±' + Math.round(S.acc) + ' m'}`;
+  h.textContent = `${S.heading == null ? 'kompas –' : 'az ' + Math.round(S.heading) % 360 + '°'}${d ? ' · ' + d : ''} · ${S.acc == null ? 'GPS –' : 'GPS ±' + Math.round(S.acc) + ' m'}`;
 }
 
 /* ---------- zpracování fotky ---------- */
@@ -560,7 +583,7 @@ async function vBridge(id) {
   $('#setaz').onclick = async () => {
     ensureSensors();
     if (S.heading == null) return toast('Kompas zatím nemá hodnotu – zapni senzory a chvíli počkej.');
-    b.az = Math.round(S.heading); await put('bridges', b); toast(`Azimut staničení ${b.az}° uložen`); route();
+    b.az = Math.round(S.heading) % 360; await put('bridges', b); toast(`Azimut staničení ${b.az}° uložen`); route();
   };
   $('#newi').onclick = async () => {
     const i = { id: uid(), bridgeId: id, druh: $('#druh').value, datum: isoDay(Date.now()), created: Date.now(),
