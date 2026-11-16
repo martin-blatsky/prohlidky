@@ -28,10 +28,13 @@
   </div>
 </main>
 <script>
-fetch('bms-balicek.js').then(r => r.text()).then(t => {
+fetch('bms-balicek.js', { cache: 'no-cache' }).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); }).then(t => {
   document.getElementById('bm').href = 'javascript:' + encodeURIComponent(t.replace(/^\s*\/\*[\s\S]*?\*\/\s*/, ''));
   document.getElementById('st').textContent = 'Připraveno. Kliknutí na tlačítko zde nic nedělá – je potřeba ho přetáhnout do záložek.';
-}).catch(() => { document.getElementById('st').textContent = 'Chyba načtení bms-balicek.js'; });
+}).catch(e => {
+  document.getElementById('st').textContent = 'Chyba načtení bms-balicek.js (' + e.message + '). ' +
+    (location.protocol === 'file:' ? 'Stránka je otevřená ze souboru v PC – otevři ji z adresy https://martin-blatsky.github.io/prohlidky/bms.html.' : 'Obnov stránku (Ctrl+F5).');
+});
 document.getElementById('bm').addEventListener('click', e => e.preventDefault());
 </script>
 </body>
