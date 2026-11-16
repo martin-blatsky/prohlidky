@@ -1,7 +1,7 @@
 'use strict';
 /* Prohlídky mostů – PWA pro sběr fotodokumentace a závad v terénu.
    Data zůstávají v zařízení (IndexedDB), ven jen přes export ZIP. */
-const APP_VERSION = '0.6.0';
+const APP_VERSION = '0.6.1';
 const LEAF = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/';
 const MAXPX = 2048;          // delší strana zmenšené fotky [px]
 const TARGET = 550 * 1024;   // cílová velikost JPEG [B]
@@ -34,11 +34,28 @@ async function tx(store, mode, fn) {
     t.onabort = () => rej(t.error);
   });
 }
-const put = (st, o) => tx(st, 'readwrite', s => s.put(o));
-const get = (st, id) => tx(st, 'readonly', s => s.get(id));
-const all = st => tx(st, 'readonly', s => s.getAll());
+/* Safari (iOS) neumí spolehlivě znovu uložit Blob, který přečetl z IndexedDB – zápis se zasekne nebo selže.
+   Proto se Bloby ukládají jako ArrayBuffer {__blob, type} a při čtení se z nich vytvoří nové Bloby v paměti. */
+async function pack(x) {
+  if (x instanceof Blob) return { __blob: await x.arrayBuffer(), type: x.type };
+  if (Array.isArray(x)) { const a = []; for (const v of x) a.push(await pack(v)); return a; }
+  if (x && typeof x === 'object' && !(x instanceof ArrayBuffer)) { const o = {}; for (const [k, v] of Object.entries(x)) o[k] = await pack(v); return o; }
+  return x;
+}
+function unpack(x) {
+  if (x && typeof x === 'object') {
+    if (x.__blob instanceof ArrayBuffer) return new Blob([x.__blob], { type: x.type || '' });
+    if (x instanceof Blob || x instanceof ArrayBuffer) return x;
+    if (Array.isArray(x)) return x.map(unpack);
+    const o = {}; for (const [k, v] of Object.entries(x)) o[k] = unpack(v); return o;
+  }
+  return x;
+}
+const put = async (st, o) => { const v = await pack(o); return tx(st, 'readwrite', s => s.put(v)); };
+const get = async (st, id) => unpack(await tx(st, 'readonly', s => s.get(id)));
+const all = async st => unpack(await tx(st, 'readonly', s => s.getAll()) || []);
 const del = (st, id) => tx(st, 'readwrite', s => s.delete(id));
-const photosOf = inspId => tx('photos', 'readonly', s => s.index('insp').getAll(inspId));
+const photosOf = async inspId => unpack(await tx('photos', 'readonly', s => s.index('insp').getAll(inspId)) || []);
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 
 /* ---------- pomocné ---------- */
@@ -350,9 +367,19 @@ async function vBridges() {
       const n = ins.filter(i => i.bridgeId === b.id), open = n.filter(i => !i.exportedAt).length, pl = b.plan === today;
       return `<li><a class="grow" href="#/most/${b.id}"><b>${esc(b.evc)}</b> ${esc(b.nazev)}<div class="muted">${b.poli || 1} ${(b.poli | 0) > 1 ? 'polí' : 'pole'}${n.length ? ` · prohlídek ${n.length}` : ''}${b.lat == null ? ' · bez souřadnic' : ''}</div></a>${open ? `<span class="badge miss">neexp. ${open}</span>` : ''}<button class="small${pl ? ' pri' : ''}" data-plan="${b.id}">${pl ? '✓ dnes' : 'dnes'}</button></li>`;
     }).join('')}</ul>` : '<p class="muted">Zatím žádné mosty. Přidej most ručně (údaje z BMS) nebo hromadně importem v sekci Data.</p>'}</div>`;
-  app.querySelectorAll('[data-plan]').forEach(bt => bt.onclick = async () => {
-    const b = bs.find(x => x.id === bt.dataset.plan);
-    b.plan = b.plan === today ? null : today; await put('bridges', b); route();
+  // přepnutí „dnes“ na místě – bez překreslení seznamu a skoku nahoru; pořadí se srovná při dalším otevření
+  app.querySelectorAll('[data-plan]').forEach(bt => bt.onclick = async ev => {
+    ev.preventDefault(); ev.stopPropagation();
+    if (bt.disabled) return; bt.disabled = true;
+    try {
+      const b = await get('bridges', bt.dataset.plan);           // čerstvý záznam (import ho mohl mezitím změnit)
+      b.plan = b.plan === today ? null : today; await put('bridges', b);
+      const on = b.plan === today;
+      bt.classList.toggle('pri', on); bt.textContent = on ? '✓ dnes' : 'dnes';
+      const n = app.querySelectorAll('[data-plan].pri').length;
+      const mapa = app.querySelector('a[href^="#/mapa"]'); if (mapa) mapa.href = n ? '#/mapa' : '#/mapa/vse';
+    } catch (e) { toast('Nepodařilo se uložit: ' + e.message, 4000); }
+    bt.disabled = false;
   });
 }
 
