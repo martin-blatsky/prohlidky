@@ -1,7 +1,7 @@
 'use strict';
 /* Prohlídky mostů – PWA pro sběr fotodokumentace a závad v terénu.
    Data zůstávají v zařízení (IndexedDB), ven jen přes export ZIP. */
-const APP_VERSION = '0.5.2';
+const APP_VERSION = '0.6.0';
 const LEAF = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/';
 const MAXPX = 2048;          // delší strana zmenšené fotky [px]
 const TARGET = 550 * 1024;   // cílová velikost JPEG [B]
@@ -323,7 +323,8 @@ async function route() {
     if (p[0] === 'zavada') return await vDefect(p[1], p[2]);
     if (p[0] === 'data') return await vData();
     if (p[0] === 'mapa') return await vMap(p[1] === 'vse');
-    if (p[0] === 'minula') return await vPrev(p[1]);
+    if (p[0] === 'minula') return await vPrev(p[1], qs.get('p'));
+    if (p[0] === 'mostni-list') return await vList(p[1]);
     if (p[0] === 'popis') return await vDesc(p[1]);
     location.hash = '#/';
   } catch (e) {
@@ -513,9 +514,9 @@ async function vBridge(id) {
       </div>
       <div class="row" style="margin-top:8px"><a class="btn grow" href="#/most/${id}/upravit">Upravit</a></div>
     </div>
-    ${b.prev ? `<div class="card"><h2>Minulá prohlídka z BMS</h2>
-      <p style="margin:0 0 8px">${esc(prevTitle(b.prev))}<br><span class="muted">SS ${esc((b.prev.rozhodnuti || {}).ss || '–')} · NK ${esc((b.prev.rozhodnuti || {}).nk || '–')} · závad ${b.prev.zavady.length} · fotek ${b.prev.fota.length}</span></p>
-      <a class="btn wide" href="#/minula/${id}">Zobrazit závady, popis a fotky</a></div>` : ''}
+    ${b.mostniList || b.prev ? `<div class="card"><h2>Podklady z BMS</h2>
+      ${b.prev ? `<p style="margin:0 0 8px">Minulá: ${esc(prevTitle(b.prev))}<br><span class="muted">SS ${esc((b.prev.rozhodnuti || {}).ss || '–')} · NK ${esc((b.prev.rozhodnuti || {}).nk || '–')} · závad ${b.prev.zavady.length} · fotek ${b.prev.fota.length}${(b.prevOther || []).length ? ` · dalších prohlídek ${b.prevOther.length}` : ''}</span></p>` : ''}
+      <div class="row">${b.mostniList ? `<a class="btn grow" href="#/mostni-list/${id}">Mostní list</a>` : ''}${b.prev ? `<a class="btn grow" href="#/minula/${id}">Minulé prohlídky</a>` : ''}</div></div>` : ''}
     <div class="card"><h2>Směr staničení kompasem</h2>
       <p class="muted">Postav se na most, namiř zadní stranu telefonu ve směru staničení a stiskni Uložit. Slouží k automatickému určení „zleva / zprava / po směru“ u fotek.</p>
       <div class="row"><span class="grow" id="hud-sens">senzory vypnuty</span><button id="sens">Zapnout</button><button class="pri" id="setaz">Uložit</button></div>
@@ -571,7 +572,7 @@ async function vInsp(id) {
       ${b.prev ? `<a class="btn grow" href="#/minula/${b.id}">Minulá prohlídka</a>` : ''}
     </div>
     ${b.prev && b.prev.zavady.length ? (() => {
-      const pc = i.prevCheck || {}, done = b.prev.zavady.filter((z, k) => pc[k] && pc[k].st).length, tot = b.prev.zavady.length;
+      const pc = checkValid(i, b) ? i.prevCheck || {} : {}, done = b.prev.zavady.filter((z, k) => pc[k] && pc[k].st).length, tot = b.prev.zavady.length;
       return `<a class="btn wide" style="margin-bottom:12px" href="#/kontrola/${id}">Závady z minulé prohlídky <span class="badge ${done === tot ? 'ok' : 'miss'}">${done}/${tot}</span></a>`;
     })() : ''}
     <div class="row" style="margin-bottom:12px">
@@ -660,12 +661,13 @@ function newDefect(i, code = '2.1') {
   i.defects.push(d); return d;
 }
 /* propojení závady se závadou z minulé prohlídky (index k v b.prev.zavady) */
-function linkPrev(i, d, k, st) {
+function linkPrev(i, d, k, st, b) {
   if (k === '' || k == null || isNaN(+k)) return;
   i.prevCheck = i.prevCheck || {};
   for (const [kk, c] of Object.entries(i.prevCheck)) if (c.defectId === d.id && kk !== String(k)) delete i.prevCheck[kk];
   d.prevIdx = +k; d.vyvoj = st || d.vyvoj || 'beze';
   i.prevCheck[k] = { st: d.vyvoj, defectId: d.id };
+  if (b) i.prevRef = refKey(b.prev);
 }
 
 /* ---------- závady z minulé prohlídky ---------- */
@@ -675,6 +677,16 @@ async function vCheck(inspId) {
   if (!b || !b.prev) { location.hash = `#/prohlidka/${inspId}`; return; }
   setTitle('Závady z minula', `#/prohlidka/${inspId}`);
   i.prevCheck = i.prevCheck || {};
+  if (!checkValid(i, b) && Object.keys(i.prevCheck).length) {
+    app.innerHTML = `<div class="card"><h2>Minulá prohlídka se změnila</h2>
+      <p>Kontrola závad byla dělaná vůči jiné minulé prohlídce, než je teď nastavená (${esc(prevTitle(b.prev))}). Závady v této prohlídce zůstanou, jen se zruší jejich vazba na minulé závady.</p>
+      <button class="pri wide" id="reset">Začít kontrolu znovu</button></div>`;
+    $('#reset').onclick = async () => {
+      i.prevCheck = {}; delete i.prevRef; i.defects.forEach(d => { delete d.prevIdx; });
+      await put('insp', i); route();
+    };
+    return;
+  }
   const zs = b.prev.zavady, ph = await photosOf(inspId);
   const fBy = n => b.prev.fota.find(f => f.poradi === n);
   const done = zs.filter((z, k) => i.prevCheck[k] && i.prevCheck[k].st).length;
@@ -702,7 +714,7 @@ async function vCheck(inspId) {
         d = newDefect(i, z.code); d.popis = z.popis; d.opatreni = z.opatreni.map(o => o.popis).join('\n');
         if (z.pozice) d.pozice = z.pozice;
       }
-      linkPrev(i, d, k, st);
+      linkPrev(i, d, k, st, b);
     } else {
       if (d) {
         const dp = (await photosOf(inspId)).filter(p => p.defectId === d.id);
@@ -710,7 +722,7 @@ async function vCheck(inspId) {
         for (const p of dp) { p.defectId = null; p.key = 'jine'; await put('photos', p); }
         i.defects = i.defects.filter(x => x.id !== d.id);
       }
-      i.prevCheck[k] = { st, defectId: null };
+      i.prevCheck[k] = { st, defectId: null }; i.prevRef = refKey(b.prev);
     }
     await put('insp', i);
     const y = window.scrollY; await vCheck(inspId); window.scrollTo(0, y);
@@ -912,7 +924,7 @@ async function vPhoto(id, fromCam) {
       let d = i2.defects.find(x => x.id === $('#def').value);
       if (!d) {
         d = newDefect(i2, $('#code').value); d.popis = $('#popis').value.trim();
-        if ($('#fromprev') && $('#fromprev').value !== '') linkPrev(i2, d, $('#fromprev').value, 'beze'); else d.vyvoj = b.prev ? 'nova' : '';
+        if ($('#fromprev') && $('#fromprev').value !== '') linkPrev(i2, d, $('#fromprev').value, 'beze', b); else d.vyvoj = b.prev ? 'nova' : '';
         setPoloha(b, d, getPol());
         await put('insp', i2);
         Diktat.learn('def', d.code, d.popis);
@@ -960,7 +972,7 @@ async function vDefect(inspId, defId) {
     d.code = $('#code').value; d.popis = $('#popis').value.trim(); d.opatreni = $('#opat').value.trim();
     setPoloha(b, d, getPol());
     const fp = $('#fromprev') ? $('#fromprev').value : '';
-    if (fp !== '') linkPrev(i, d, fp, vyv === 'nova' || !vyv ? 'beze' : vyv);
+    if (fp !== '') linkPrev(i, d, fp, vyv === 'nova' || !vyv ? 'beze' : vyv, b);
     else {
       if (i.prevCheck) for (const [k, c] of Object.entries(i.prevCheck)) if (c.defectId === d.id) delete i.prevCheck[k];
       delete d.prevIdx; d.vyvoj = vyv;
@@ -1028,7 +1040,7 @@ async function buildExport(i, b, ph) {
     });
   }
   if (!i.defects.length) L.push('Bez zaznamenaných závad.');
-  if (b.prev && i.prevCheck) {
+  if (b.prev && i.prevCheck && Object.keys(i.prevCheck).length && checkValid(i, b)) {
     const zs = b.prev.zavady, pc = i.prevCheck;
     const lst = st => zs.map((z, k) => [z, pc[k]]).filter(([, c]) => c && c.st === st).map(([z]) => `- [${z.code}] ${z.popis}`);
     const odst = lst('odst'), nez = lst('nez'), bez = zs.filter((z, k) => !pc[k] || !pc[k].st).map(z => `- [${z.code}] ${z.popis}`);
@@ -1129,7 +1141,7 @@ async function vData() {
 
 /* ---------- balíček z BMS ---------- */
 async function importPackage(j, progress) {
-  const bs = await all('bridges'); let nNew = 0, nUpd = 0, nPh = 0;
+  const bs = await all('bridges'); let nNew = 0, nUpd = 0, nPh = 0, nInsp = 0;
   for (const [k, m] of (j.mosty || []).entries()) {
     progress && progress(`${k + 1}/${j.mosty.length} ${m.evc}`);
     let b = bs.find(x => normEvc(x.evc) === normEvc(m.evc));
@@ -1140,29 +1152,63 @@ async function importPackage(j, progress) {
     if (m.smer) b.smer = m.smer;
     if (m.staniceni != null) b.staniceni = m.staniceni;
     b.bmsGuid = m.guid;
-    if (m.prohlidka) {
-      const p = m.prohlidka;
-      const fota = [];
-      for (const f of p.fota || []) { fota.push({ poradi: f.poradi, popis: f.popis, blob: await dataUrlToBlob(f.img) }); nPh++; }
-      b.prev = { ...p, fota, importovano: Date.now() };
-      Diktat.learnPrev(p);
+    if (m.mostniList) b.mostniList = decEnt(m.mostniList);
+    const incoming = m.prohlidky && m.prohlidky.length ? m.prohlidky : m.prohlidka ? [m.prohlidka] : [];
+    if (incoming.length) {
+      // sloučit s dříve importovanými prohlídkami (podle GUID, u starých balíčků podle data a druhu)
+      const key = p => p.guid || `${String(p.datum).slice(0, 10)}|${p.kod || p.druh}`;
+      const have = new Map([b.prev, ...(b.prevOther || [])].filter(Boolean).map(p => [key(p), p]));
+      const pinned = b.prev && b.prevPinned ? key(b.prev) : null;
+      for (const p0 of incoming) {
+        const { fota: f0, ...rest } = p0;
+        const p = decEnt(rest);
+        if (!p.typ) p.typ = /hlavn/i.test(p.druh || '') ? 'hlavni' : /mimořád/i.test(p.druh || '') ? 'mimoradna' : /běžn/i.test(p.druh || '') ? 'bezna' : 'jina';
+        p.datum = String(p.datum || '').slice(0, 10);
+        const fota = [];
+        for (const f of f0 || []) { fota.push({ poradi: f.poradi, popis: decEnt(f.popis), blob: f.img ? await dataUrlToBlob(f.img) : null }); if (f.img) nPh++; }
+        have.set(key(p), { ...p, fota, importovano: Date.now() });
+        nInsp++;
+        Diktat.learnPrev({ ...p, fota });
+      }
+      const listP = [...have.values()].sort((a, c) => String(c.datum).localeCompare(String(a.datum)));
+      // referenční „minulá prohlídka“ (kontrolní seznam závad z minula): ručně zvolená, jinak poslední hlavní, jinak nejnovější
+      const ref = (pinned && have.get(pinned)) || listP.find(p => p.typ === 'hlavni') || listP[0];
+      b.prev = ref; b.prevOther = listP.filter(p => p !== ref);
     }
     await put('bridges', b);
   }
-  return `Import hotov: nových ${nNew}, aktualizovaných ${nUpd}, fotek ${nPh}.`;
+  return `Import hotov: nových ${nNew}, aktualizovaných ${nUpd}, prohlídek ${nInsp}, fotek ${nPh}.`;
+}
+/* HTML entity v textech z BMS (&#34; &quot; …) → znaky; rekurzivně, obrázky (data:) beze změny */
+const _ta = document.createElement('textarea');
+function decEnt(x) {
+  if (typeof x === 'string') { if (!/&[#a-z0-9]+;/i.test(x) || x.startsWith('data:')) return x; _ta.innerHTML = x; return _ta.value; }
+  if (Array.isArray(x)) return x.map(decEnt);
+  if (x && typeof x === 'object' && !(x instanceof Blob)) { const o = {}; for (const [k, v] of Object.entries(x)) o[k] = decEnt(v); return o; }
+  return x;
 }
 const prevTitle = p => `${p.kod || p.druh} ${fmtDate(p.datum)}${p.prohlizel ? ', ' + p.prohlizel : ''}`;
+const refKey = p => p ? (p.guid || `${String(p.datum).slice(0, 10)}|${p.kod || p.druh}`) : '';
+const prevAll = b => [b.prev, ...(b.prevOther || [])].filter(Boolean).sort((a, c) => String(c.datum).localeCompare(String(a.datum)));
+/* kontrola závad z minula v prohlídce i patří k aktuální referenční minulé prohlídce mostu? */
+const checkValid = (i, b) => !i.prevRef || i.prevRef === refKey(b.prev);
 const capClean = s => String(s || '').replace(/\.(jpe?g|png)$/i, '').replace(/^\d+[_\s-]*/, '');
 
 /* minulá prohlídka */
-async function vPrev(id) {
+async function vPrev(id, sel) {
   const b = await get('bridges', id);
   if (!b || !b.prev) { location.hash = `#/most/${id}`; return; }
-  const p = b.prev, ro = p.rozhodnuti || {};
-  setTitle(`${b.evc} – minulá prohlídka`, `#/most/${id}`);
+  const list = prevAll(b);
+  const p = list.find(x => refKey(x) === sel) || b.prev, ro = p.rozhodnuti || {}, isRef = p === b.prev;
+  setTitle(`${b.evc} – minulé prohlídky`, `#/most/${id}`);
   const fBy = n => p.fota.find(f => f.poradi === n);
-  const th = f => f && f.blob ? `<a class="thumb" href="#" data-big="${f.poradi}"><img loading="lazy" src="${blobUrl(f.blob)}" alt=""><span class="n">${f.poradi}</span></a>` : '';
+  const th = f => f && f.blob ? `<a class="thumb" href="#" data-big="${f.poradi}"><img loading="lazy" src="${blobUrl(f.blob)}" alt=""><span class="n">${f.poradi}</span></a>` : f ? `<span class="badge">foto ${f.poradi}</span>` : '';
+  const TYP = { hlavni: 'hlavní', mimoradna: 'mimořádná', bezna: 'běžná', jina: 'jiná' };
   app.innerHTML = `
+    ${list.length > 1 ? `<div class="card"><label style="margin-top:0">Prohlídka (${list.length} importováno)</label>
+      <select id="psel">${list.map(x => `<option value="${esc(refKey(x))}"${x === p ? ' selected' : ''}>${fmtDate(x.datum)} – ${esc(TYP[x.typ] || x.druh || '')}${x === b.prev ? ' ★ minulá pro kontrolu závad' : ''}</option>`).join('')}</select>
+      ${isRef ? '<p class="muted" style="margin:6px 0 0">★ Tato prohlídka slouží jako „minulá“ pro závady z minula, popis částí (B) a galerii Minulé v kameře.</p>'
+        : '<button class="wide" id="mkref" style="margin-top:8px">Použít jako minulou prohlídku (závady z minula, popis B, galerie)</button>'}</div>` : ''}
     <div class="card"><h2>${esc(prevTitle(p))}</h2>
       <div class="kv">
         <b>Spodní stavba</b><span>${esc(ro.ss || '–')}</span>
@@ -1183,9 +1229,37 @@ async function vPrev(id) {
       ${p.casti.map(c => `<p><b>[${esc(c.code)}] ${esc(c.nazev)}${c.pozice ? ' – ' + esc(c.pozice) : ''}</b><br><span style="white-space:pre-wrap">${esc(c.popis) || '–'}</span></p>`).join('')}
     </details></div>
     <div class="card"><h2>Fotky (${p.fota.length})</h2>
-      <div class="grid">${p.fota.map(f => f.blob ? `<a class="thumb" href="#" data-big="${f.poradi}"><img loading="lazy" src="${blobUrl(f.blob)}" alt=""><span class="n">${f.poradi}</span><span class="cap">${esc(capClean(f.popis))}</span></a>` : '').join('')}</div>
+      ${p.fota.some(f => f.blob) ? `<div class="grid">${p.fota.map(f => f.blob ? `<a class="thumb" href="#" data-big="${f.poradi}"><img loading="lazy" src="${blobUrl(f.blob)}" alt=""><span class="n">${f.poradi}</span><span class="cap">${esc(capClean(f.popis))}</span></a>` : '').join('')}</div>` : ''}
+      ${p.fota.some(f => !f.blob) ? `<details${p.fota.some(f => f.blob) ? '' : ' open'}><summary>Popisky fotek bez náhledu (${p.fota.filter(f => !f.blob).length})</summary><ol style="padding-left:22px">${p.fota.filter(f => !f.blob).map(f => `<li value="${f.poradi}">${esc(capClean(f.popis))}</li>`).join('')}</ol></details>` : ''}
     </div>`;
   bindBig(app, p.fota);
+  if ($('#psel')) $('#psel').onchange = e => { location.hash = `#/minula/${id}?p=${encodeURIComponent(e.target.value)}`; };
+  if ($('#mkref')) $('#mkref').onclick = async () => {
+    const ins = (await all('insp')).filter(i => i.bridgeId === id && i.prevCheck && Object.keys(i.prevCheck).length && checkValid(i, b));
+    if (ins.length && !confirm(`Rozpracovaná kontrola závad z minula (${ins.length} prohlídka/y) je vázaná na dosavadní minulou prohlídku a bude potřeba ji projít znovu. Pokračovat?`)) return;
+    b.prevOther = list.filter(x => x !== p); b.prev = p; b.prevPinned = true;
+    await put('bridges', b); toast('Nastaveno jako minulá prohlídka'); route();
+  };
+}
+
+/* mostní list z BMS */
+async function vList(id) {
+  const b = await get('bridges', id);
+  if (!b || !b.mostniList) { location.hash = `#/most/${id}`; return; }
+  const m = b.mostniList;
+  setTitle(`${b.evc} – mostní list`, `#/most/${id}`);
+  const kv = rows => rows.length ? `<div class="kv">${rows.map(([k, v]) => `<b>${esc(k)}</b><span>${esc(typeof v === 'number' ? String(v).replace('.', ',') : v)}</span>`).join('')}</div>` : '<p class="muted">–</p>';
+  const txt = (t, s) => s ? `<p><b>${t}</b><br><span style="white-space:pre-wrap">${esc(s)}</span></p>` : '';
+  app.innerHTML = `
+    <div class="card"><h2>${esc(b.evc)} ${esc(b.nazev)}</h2>${kv(m.spravni || [])}${txt('Poznámka', m.poznamka)}</div>
+    <div class="card"><h2>Stav a zatížitelnost (evidence)</h2>${kv(m.stav || [])}</div>
+    <div class="card"><h2>Rozměry a základní údaje</h2>${kv(m.rozmery || [])}${txt('Spodní stavba', m.popisSS)}${txt('Nosná konstrukce', m.popisNK)}${txt('Poznámka k NK', m.poznNK)}</div>
+    <div class="card"><details><summary>Části mostu (${(m.casti || []).length})</summary>
+      ${(m.casti || []).map(c => `<p><b>[${esc(c.code)}] ${esc(c.nazev)}${c.pozice ? ' – ' + esc(c.pozice) : ''}</b>
+        ${(c.prvky || []).map(x => `<br><span class="muted">${esc(x)}</span>`).join('')}
+        ${c.popis ? `<br><span style="white-space:pre-wrap">${esc(c.popis)}</span>` : ''}</p>`).join('')}</details></div>
+    ${(m.historie || []).length ? `<div class="card"><details><summary>Provozní historie (${m.historie.length})</summary>${m.historie.map(h => `<p><b>${fmtDate(h.datum)} ${esc(h.druh)}</b><br><span style="white-space:pre-wrap">${esc(h.text)}</span></p>`).join('')}</details></div>` : ''}
+    ${(m.prilohy || []).length ? `<div class="card"><h2>Přílohy v BMS (jen názvy)</h2><ul>${m.prilohy.map(a => `<li>${esc(a)}</li>`).join('')}</ul></div>` : ''}`;
 }
 function bindBig(root, fota) {
   root.querySelectorAll('[data-big]').forEach(a => a.onclick = ev => {
