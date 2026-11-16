@@ -1,7 +1,7 @@
 'use strict';
 /* Prohlídky mostů – PWA pro sběr fotodokumentace a závad v terénu.
    Data zůstávají v zařízení (IndexedDB), ven jen přes export ZIP. */
-const APP_VERSION = '0.7.0';
+const APP_VERSION = '0.7.1';
 const LEAF = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/';
 const MAXPX = 2048;          // delší strana zmenšené fotky [px]
 const TARGET = 550 * 1024;   // cílová velikost JPEG [B]
@@ -1124,8 +1124,8 @@ async function vData() {
   try { const e = await navigator.storage.estimate(); est = `${num(e.usage / 1048576, 1)} MB z ${num(e.quota / 1048576, 0)} MB`; } catch (e) { /* */ }
   const pers = navigator.storage && navigator.storage.persisted ? await navigator.storage.persisted() : false;
   app.innerHTML = `
-    <div class="card"><h2>Import balíčku z BMS</h2>
-      <p class="muted">Soubor <code>balicek_….json</code> ze záložky „Balíček z BMS“ (návod na stránce <a href="bms.html">bms.html</a>). Doplní souřadnice, počet polí, směr staničení a poslední hlavní prohlídku vč. náhledů fotek. Mosty se párují podle ev. č.</p>
+    <div class="card"><h2>Import balíčku z BMS / CEV2</h2>
+      <p class="muted">Soubor <code>balicek_….json</code> ze záložky „Balíček z BMS“ nebo „Balíček z CEV2“ (návod na stránce <a href="bms.html">bms.html</a>). Doplní souřadnice, počet polí, mostní list a vybrané prohlídky vč. náhledů fotek. Mosty se párují podle ev. č.</p>
       <label class="btn pri wide">Vybrat balíček…<input type="file" id="pkg" accept=".json,application/json" hidden></label>
       <p class="muted" id="pkgst"></p>
     </div>
@@ -1170,7 +1170,7 @@ async function vData() {
     try {
       st.textContent = 'Načítám…';
       const j = JSON.parse(await f.text());
-      if (j.format !== 'prohlidky-balicek') throw new Error('Není to balíček z BMS.');
+      if (j.format !== 'prohlidky-balicek') throw new Error('Není to balíček z BMS / CEV2.');
       const r = await importPackage(j, t => { st.textContent = t; });
       toast(r, 5000); st.textContent = r;
     } catch (err) { st.textContent = 'Chyba: ' + err.message; }
@@ -1221,8 +1221,10 @@ async function importPackage(j, progress) {
         Diktat.learnPrev({ ...p, fota });
       }
       const listP = [...have.values()].sort((a, c) => String(c.datum).localeCompare(String(a.datum)));
-      // referenční „minulá prohlídka“ (kontrolní seznam závad z minula): ručně zvolená, jinak poslední hlavní, jinak nejnovější
-      const ref = (pinned && have.get(pinned)) || listP.find(p => p.typ === 'hlavni') || listP[0];
+      // referenční „minulá prohlídka“ (kontrolní seznam závad z minula): ručně zvolená, jinak poslední dokončená hlavní,
+      //   jinak poslední hlavní (i nedokončená), jinak nejnovější
+      const dokonc = p => !/^nedokon/i.test(String(p.dokonceno || ''));
+      const ref = (pinned && have.get(pinned)) || listP.find(p => p.typ === 'hlavni' && dokonc(p)) || listP.find(p => p.typ === 'hlavni') || listP[0];
       b.prev = ref; b.prevOther = listP.filter(p => p !== ref);
     }
     await put('bridges', b);
@@ -1326,7 +1328,7 @@ async function vDesc(inspId) {
   if (!i.casti) i.casti = [];
   app.innerHTML = `
     <div class="card">
-      <p class="muted">Oddíl B zprávy. ${b.prev ? `Převzít lze z ${esc(prevTitle(b.prev))}.` : 'Minulá prohlídka není importovaná (Data → Import balíčku z BMS).'}</p>
+      <p class="muted">Oddíl B zprávy. ${b.prev ? `Převzít lze z ${esc(prevTitle(b.prev))}.` : 'Minulá prohlídka není importovaná (Data → Import balíčku z BMS / CEV2).'}</p>
       <div class="row">${b.prev ? '<button class="grow" id="take">Převzít z minulé prohlídky</button>' : ''}<button class="grow" id="add">+ Část</button></div>
     </div>
     ${i.casti.map((c, k) => `<div class="card">

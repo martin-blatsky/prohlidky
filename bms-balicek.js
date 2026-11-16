@@ -13,7 +13,7 @@
   const img = async u => {
     try {
       const r = await fetch(u, { credentials: 'same-origin' }); if (!r.ok) return null;
-      const b = await r.blob();
+      const b = await r.blob(); if (!/^image\//.test(b.type)) return null;
       return await new Promise(res => { const f = new FileReader(); f.onload = () => res(f.result); f.readAsDataURL(b); });
     } catch (e) { return null; }
   };
@@ -37,7 +37,8 @@
     #pmb-ui button{padding:6px 14px;border-radius:6px;border:1px solid #1f3a5f;background:#fff;color:#1f3a5f;cursor:pointer;font:inherit}
     #pmb-ui button.p{background:#1f3a5f;color:#fff}#pmb-ui button:disabled{opacity:.5}#pmb-ui .m{color:#5f6b78;font-size:12px}
     #pmb-ui table{border-collapse:collapse;width:100%;font-size:13px}#pmb-ui td,#pmb-ui th{border-bottom:1px solid #d9dee5;padding:4px;text-align:left;vertical-align:top}
-    #pmb-ui .err{color:#b3261e}#pmb-ui .row{display:flex;gap:8px;justify-content:flex-end;margin-top:10px}#pmb-ui fieldset{border:1px solid #d9dee5;border-radius:6px;margin:8px 0}</style>`;
+    #pmb-ui .err{color:#b3261e}#pmb-ui .row{display:flex;gap:8px;justify-content:flex-end;margin-top:10px}#pmb-ui fieldset{border:1px solid #d9dee5;border-radius:6px;margin:8px 0}
+    #pmb-ui select{font:inherit;font-size:13px;max-width:100%;margin:2px 0 4px}</style>`;
   const head = t => `${css}<h3><span>${t}</span><span style="cursor:pointer" id="pmb-x">✕</span></h3>`;
   const bindX = () => { ui.querySelector('#pmb-x').onclick = () => ui.remove(); };
   const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -74,6 +75,7 @@
 
   /* krok 2: vyhledání a kontrola */
   let rows = [];
+  const hotova = x => !/^nedokon/i.test(String(x.z.StavDokonceni || ''));   // „nedokončena“ vs. „dokončena“, „dokončena, schválena“
   async function step2() {
     const list = opt.evc.split(/[,;\n]+/).map(s => s.trim()).filter(Boolean);
     ui.innerHTML = head('Kontrola mostů') + `<div class="b" id="pmb-b">Hledám…</div>`; bindX();
@@ -95,24 +97,43 @@
           const all = (P.ProhlidkaList || []).filter(x => !x.JeSmazan).map(x => ({ guid: x.GuidId, z: x.ZakladniUdaje || {} }))
             .map(x => ({ ...x, typ: typ(x.z), datum: iso(x.z.Datum) })).filter(x => x.typ !== 'aktualizace')
             .sort((a, c) => c.datum.localeCompare(a.datum));
-          const pick = opt.vse ? all : opt.typy.map(t => all.find(x => x.typ === t)).filter(Boolean);
-          rows.push({ evc: `${o.Silnice}-${o.PoradoveCislo}`, o, all, pick, check: exact.length === 1, multi: use.length > 1,
+          // poslední prohlídka daného typu; když je nedokončená a existuje starší dokončená, nabídne se volba
+          const pick = [], volby = [];
+          if (opt.vse) pick.push(...all);
+          else for (const t of opt.typy) {
+            const last = all.find(x => x.typ === t); if (!last) continue;
+            const dok = hotova(last) ? null : all.find(x => x.typ === t && hotova(x));
+            if (dok) volby.push({ typ: t, ned: last, dok }); else pick.push(last);
+          }
+          rows.push({ evc: `${o.Silnice}-${o.PoradoveCislo}`, o, all, pick, volby, check: exact.length === 1, multi: use.length > 1,
             miss: opt.vse ? [] : opt.typy.filter(t => !all.some(x => x.typ === t)) });
         }
       } catch (e) { rows.push({ evc, err: e.message }); }
     }
+    const nedok = p => hotova(p) ? '' : ` <span class="err">(nedokončena${opt.vse ? '' : ', dokončená neexistuje'})</span>`;
+    const volba = (v, k, i) => `<div>${TYPN[v.typ]}: <span class="err">poslední je nedokončená</span><br>
+      <select class="pmb-sel" data-r="${k}" data-i="${i}"><option value="dok">poslední dokončená ${cz(v.dok.datum)}</option>
+      <option value="ned">nedokončená ${cz(v.ned.datum)}</option><option value="obe">obě</option></select></div>`;
+    const PORADI = ['hlavni', 'mimoradna', 'bezna', 'jina'];
+    const radky = (r, k) => (opt.vse ? r.pick.map(p => ({ t: p.typ, h: `<div>${TYPN[p.typ]} ${cz(p.datum)}${nedok(p)}</div>` }))
+      : [...r.pick.map(p => ({ t: p.typ, h: `<div>${TYPN[p.typ]} ${cz(p.datum)}${nedok(p)}</div>` })), ...r.volby.map((v, i) => ({ t: v.typ, h: volba(v, k, i) }))]
+        .sort((a, c) => PORADI.indexOf(a.t) - PORADI.indexOf(c.t))).map(x => x.h).join('');
     b.innerHTML = `<div class="m">Zkontroluj, že jde opravdu o tyto mosty. Stáhnou se jen zaškrtnuté.</div>
       <table><tr><th></th><th>Most</th><th>Stáhne se</th></tr>${rows.map((r, k) => r.err
         ? `<tr><td></td><td><b>${esc(r.evc)}</b></td><td class="err">${esc(r.err)}</td></tr>`
         : `<tr><td><input type="checkbox" data-k="${k}" ${r.check ? 'checked' : ''}></td>
            <td><b>${esc(r.evc)}</b> ${esc(r.o.Nazev)}<div class="m">${esc((r.o.SpravceList || '').replace(/,\s*$/, ''))} · stav ${esc(r.o.StavebniStavNazev || '–')}${r.multi ? ' · <span class="err">více shod – vyber správný</span>' : ''}</div></td>
-           <td>mostní list<br>${r.pick.map(p => `${TYPN[p.typ]} ${cz(p.datum)}`).join('<br>') || '<span class="m">žádná prohlídka</span>'}${r.miss.length ? `<div class="err">nemá: ${r.miss.map(t => TYPN[t]).join(', ')}</div>` : ''}</td></tr>`).join('')}</table>
+           <td>mostní list${radky(r, k)}${r.pick.length || r.volby.length ? '' : '<span class="m">žádná prohlídka</span>'}${r.miss.length ? `<div class="err">nemá: ${r.miss.map(t => TYPN[t]).join(', ')}</div>` : ''}</td></tr>`).join('')}</table>
       <div class="m" style="margin-top:6px">${opt.foto ? 'S náhledy fotek' : 'Bez fotek'}${opt.vse ? ' · všechny prohlídky – s fotkami může být soubor velký (desítky MB na most)' : ''}.</div>
       <div class="row"><button id="pmb-back">Zpět</button><button class="p" id="pmb-dl">Stáhnout</button></div>`;
     const cnt = () => { const n = ui.querySelectorAll('[data-k]:checked').length; const bt = ui.querySelector('#pmb-dl'); bt.textContent = `Stáhnout (${n})`; bt.disabled = !n; };
     ui.querySelectorAll('[data-k]').forEach(c => c.onchange = cnt); cnt();
     ui.querySelector('#pmb-back').onclick = step1;
-    ui.querySelector('#pmb-dl').onclick = () => step3([...ui.querySelectorAll('[data-k]:checked')].map(c => rows[+c.dataset.k]));
+    const vyber = k => { const r = rows[k], p = [...r.pick];
+      r.volby.forEach((v, i) => { const s = ui.querySelector(`.pmb-sel[data-r="${k}"][data-i="${i}"]`).value;
+        if (s !== 'ned') p.push(v.dok); if (s !== 'dok') p.push(v.ned); });
+      return { ...r, pick: p.sort((a, c) => c.datum.localeCompare(a.datum)) }; };
+    ui.querySelector('#pmb-dl').onclick = () => step3([...ui.querySelectorAll('[data-k]:checked')].map(c => vyber(+c.dataset.k)));
   }
 
   /* mostní list z karty objektu */
@@ -122,31 +143,37 @@
     HloubkaVody: 'Hloubka vody [m]', VolnaVyskaNadVozovkou: 'Volná výška nad vozovkou [m]', CelkovyPocetPoli: 'Počet polí', OznaceniSikmostiNazev: 'Šikmost',
     Sikmost: 'Šikmost (hodnota v BMS)', PlochaMostu: 'Plocha mostu [m²]', PlochaVozovky: 'Plocha vozovky [m²]', RokPostaveni: 'Rok postavení', RokRekonstrukce: 'Rok rekonstrukce' };
   const rnd = v => typeof v === 'number' && !Number.isInteger(v) ? +v.toFixed(2) : typeof v === 'string' ? v.trim() : v;   // 10.800000190734863 → 10.8
+  // náhradní popisky polí prvku, když část nemá AttributeList (převzato z verze pro CEV2)
+  const PRVEK = { MaterialNazev: 'Materiál', MaterialDalsiNazev: 'Další materiál', ZpusobNazev: 'Způsob', DruhNazev: 'Druh', TypNazev: 'Typ',
+    PrefabrikatNazev: 'Prefabrikát', VrstvaNazev: 'Vrstva', UmisteniNazev: 'Umístění', UmisteniText: 'Umístění', VybaveniNazev: 'Vybavení',
+    VyplnNazev: 'Výplň', UrovenNazev: 'Úroveň', TypOdvodnovaceNazev: 'Typ odvodňovače', Vyrobce: 'Výrobce', VyrobniTypoveOznaceni: 'Typové označení',
+    Pocet: 'Počet', Delka: 'Délka [m]', Sirka: 'Šířka [m]', Tloustka: 'Tloušťka', Rozpeti: 'Rozpětí [m]', KonstrukcniVyska: 'Konstrukční výška [m]',
+    SvetlostKolma: 'Světlost kolmá [m]', SvetlostSikma: 'Světlost šikmá [m]', JmenovityPosun: 'Jmenovitý posun', Skladba: 'Skladba', Poznamka: 'Poznámka' };
   function mostniList(d) {
     const sp = d.SpravniUdaje || {}, zu = (d.Charakteristika || {}).ZakladniUdaje || {}, pc = d.ProvozniCharakteristika || {}, so = pc.Soucasny || {};
     const kv = (o, map) => Object.entries(map).map(([k, l]) => [l, rnd(o[k])]).filter(([, v]) => v !== null && v !== undefined && v !== '' && v !== 'Nezadaný');
     const attrs = {}; (d.CastObjektuList || []).forEach(c => { attrs[c.GuidId] = c.AttributeList || []; });
+    const prvek = (e, at) => (at.length ? at.map(a => [a.Name, rnd(e[a.Column + 'Nazev'] ?? e[a.Column])]) : Object.entries(PRVEK).map(([k, l]) => [l, rnd(k === 'Poznamka' ? strip(e[k]) : e[k])]))
+      .filter(([, v]) => v !== null && v !== undefined && v !== '').map(([n, v]) => `${n}: ${v}`).join(', ');
     const casti = (d.ObjektCastGroupList || []).flatMap(gr => (gr.ObjektCastList || []).filter(c => !c.JeSmazan).map(c => ({
       code: code(gr.CastObjektuNazev), nazev: String(gr.CastObjektuNazev || '').replace(/^\s*[\d.]+\s*/, ''),
       pozice: [c.PoziceNazev !== '-' ? c.PoziceNazev : '', c.PoziceText].filter(Boolean).join(' '), popis: strip(c.Poznamka),
-      prvky: (c.MostElementList || []).filter(e => !e.JeSmazan).map(e => (attrs[gr.CastObjektuGuidId] || [])
-        .map(a => [a.Name, rnd(e[a.Column + 'Nazev'] ?? e[a.Column])]).filter(([, v]) => v !== null && v !== undefined && v !== '')
-        .map(([n, v]) => `${n}: ${v}`).join(', ')).filter(Boolean),
+      prvky: (c.MostElementList || []).filter(e => !e.JeSmazan).map(e => prvek(e, attrs[gr.CastObjektuGuidId] || [])).filter(Boolean),
     })));
     return {
       spravni: kv(sp, { Nazev: 'Název', MistniNazev: 'Místní název', TridaKomunikaceNazev: 'Třída komunikace', CisloUseku: 'Číslo úseku',
         ProvozniStaniceni: 'Provozní staničení [km]', UsekoveStaniceni: 'Úsekové staničení [km]', KrajNazev: 'Kraj', OkresNazev: 'Okres', ObecNazev: 'Obec',
         KatastralniUzemiNazev: 'Katastrální území', SpravceNazev: 'Správce', PredmetPremosteniNazev: 'Předmět přemostění', VodniTokNazev: 'Vodní tok',
         ZpusobUzivaniNazev: 'Způsob užívání', DruhZatimnihoMostuNazev: 'Druh zatímního mostu', OdpovednyUzivatelNazev: 'Odpovědná osoba', DatumPosledniZmeny: 'Poslední změna' })
-        .concat(sp.SpravceList ? [['Správci', sp.SpravceList.filter(s => !s.JeSmazan).map(s => s.Popis).join(' / ')]] : []),
+        .concat(Array.isArray(sp.SpravceList) ? [['Správci', sp.SpravceList.filter(s => !s.JeSmazan).map(s => s.Popis).join(' / ')]] : []),
       poznamka: strip(sp.Poznamka),
       rozmery: kv(zu, ZU),
-      popisSS: strip(zu.PopisSpodniStavby || d.PopisSpodniStavby), popisNK: strip(zu.PopisNosneKonstrukce || d.PopisNosneKonstrukce), poznNK: strip(d.PoznamkaNosneKonstrukce),
+      popisSS: strip(zu.PopisSpodniStavby || d.PopisSpodniStavby), popisNK: strip(zu.PopisNosneKonstrukce || d.PopisNosneKonstrukce), poznNK: strip(zu.PoznamkaNosneKonstrukce || d.PoznamkaNosneKonstrukce),
       stav: kv({ ...pc, ...so }, { SpodniStavbaStavNazev: 'Spodní stavba', NosnaKonstrukceStavNazev: 'Nosná konstrukce', PouzitelnostNazev: 'Použitelnost',
         Vn: 'Vn [t]', Vr: 'Vr [t]', Ve: 'Ve [t]', NapravovyTlak: 'Nápravový tlak [t]', ZpusobZjisteniNazev: 'Způsob zjištění zatížitelnosti' }),
       casti,
       historie: ((d.ProvozniStadium || {}).PolozkyList || []).filter(x => !x.JeSmazan).map(x => ({ druh: x.DruhNazev, datum: iso(x.Datum), text: strip(x.Text) })),
-      prilohy: (d.PrilohaList || []).filter(a => !a.JeSmazan).map(a => a.Popis || a.Soubor),
+      prilohy: (d.PrilohaList || []).filter(a => !a.JeSmazan).map(a => strip(a.Popis) || a.Soubor),
     };
   }
   async function prohlidka(guid, p0, foto, log) {
@@ -156,13 +183,13 @@
     const casti = (r.ObjektCastList || []).filter(c => !c.JeSmazan);
     const poz = c => [c.PoziceNazev && c.PoziceNazev !== '-' ? c.PoziceNazev : '', c.PoziceText].filter(Boolean).join(' ');
     const out = {
-      guid, typ: p0.typ, druh: z.DruhNazev, kod: z.DruhKod, datum: iso(z.Datum), prohlizel: z.ProhlidkarNazev, pocasi: strip(z.Pocasi), smer: z.StaniceniVeSmeru || '',
-      zpristupneni: strip(z.Zpristupneni), poznamka: strip(z.Poznamka), dokonceno: p0.z.StavDokonceni ?? null,
+      guid, typ: p0.typ, druh: z.DruhNazev || p0.z.DruhNazev, kod: z.DruhKod || p0.z.DruhKod, datum: iso(z.Datum || p0.z.Datum), prohlizel: z.ProhlidkarNazev || p0.z.ProhlidkarNazev,
+      pocasi: strip(z.Pocasi), smer: z.StaniceniVeSmeru || '', zpristupneni: strip(z.Zpristupneni), poznamka: strip(z.Poznamka), dokonceno: p0.z.StavDokonceni ?? null,
       casti: casti.map(c => ({ code: code(c.CastObjektuNazev), nazev: String(c.CastObjektuNazev || '').replace(/^\s*[\d.]+\s*/, ''), pozice: poz(c), popis: strip(c.Poznamka) })),
       zavady: casti.flatMap(c => (c.ZavadaList || []).filter(x => !x.JeSmazan).map(x => ({
-        code: code(c.CastObjektuNazev), pozice: poz(c), popis: strip(x.Popis), stav: x.StavNazev || '',
+        code: code(c.CastObjektuNazev), pozice: poz(c), popis: strip(x.Popis), stav: x.StavNazev || c.StavNazev || '',
         opatreni: (x.OpatreniList || []).filter(q => !q.JeSmazan).map(q => ({ popis: strip(q.Popis), nalehavost: q.StupenNalehavostiNazev || '', splneno: !!q.Splneno })),
-        fota: (x.PrilohaList || []).map(a => a.Poradi),
+        fota: (x.PrilohaList || []).filter(a => !a.JeSmazan).map(a => a.Poradi),
       }))),
       rozhodnuti: { ss: ro.SpodniStavbaStavNazev, nk: ro.NosnaKonstrukceStavNazev, pouzitelnost: ro.PouzitelnostNazev, vn: ro.Vn, vr: ro.Vr, ve: ro.Ve, naprava: ro.NapravovyTlak, poznamka: strip(ro.StavebniStavPoznamka) },
       fota: [],
@@ -198,7 +225,9 @@
           most.prohlidky.push(await prohlidka(p0.guid, p0, opt.foto, pl));
         }
         // zpětná kompatibilita: „prohlidka“ = poslední hlavní, jinak nejnovější stažená
-        most.prohlidka = most.prohlidky.find(p => p.typ === 'hlavni') || most.prohlidky[0] || null;
+        //   (při stažení obou má přednost dokončená)
+        const dokonc = p => !/^nedokon/i.test(String(p.dokonceno || ''));
+        most.prohlidka = most.prohlidky.find(p => p.typ === 'hlavni' && dokonc(p)) || most.prohlidky.find(p => p.typ === 'hlavni') || most.prohlidky[0] || null;
         most.smer = (most.prohlidky.find(p => p.smer) || {}).smer || '';
         out.mosty.push(most);
       } catch (e) { errs.push(`${r.evc}: ${e.message}`); }

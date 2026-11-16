@@ -3,39 +3,45 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Záložka pro BMS</title>
+<title>Záložky pro BMS a CEV2</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<header id="top"><h1>Záložka „Balíček z BMS“</h1></header>
+<header id="top"><h1>Záložky „Balíček z BMS / CEV2“</h1></header>
 <main>
   <div class="card">
     <h2>1. Instalace (jednou, na PC)</h2>
-    <p>Přetáhni tlačítko níže myší na <b>lištu záložek</b> prohlížeče (Chrome/Edge: lištu zapneš Ctrl+Shift+B).</p>
-    <p><a class="btn pri" id="bm" href="#">⬇ Balíček z BMS</a></p>
+    <p>Přetáhni tlačítko myší na <b>lištu záložek</b> prohlížeče (Chrome/Edge: lištu zapneš Ctrl+Shift+B).</p>
+    <p><a class="btn pri" id="bm" href="#">⬇ Balíček z BMS</a> <span class="muted">pro bms.clevera.cz (krajské silnice)</span></p>
     <p class="muted" id="st">Načítám…</p>
+    <p><a class="btn pri" id="bmc" href="#">⬇ Balíček z CEV2</a> <span class="muted">pro cev2.rsd.cz/bridge (ŘSD)</span></p>
+    <p class="muted" id="stc">Načítám…</p>
   </div>
   <div class="card">
     <h2>2. Použití</h2>
     <ol>
-      <li>Přihlas se do <b>bms.clevera.cz</b>.</li>
-      <li>Klikni na záložku „Balíček z BMS“. Zadej ev. č. mostů, např. <code>605-026, 23617-1</code>, a vyber prohlídky (poslední hlavní / mimořádná / běžná nebo všechny) a jestli s náhledy fotek.</li>
-      <li>Záložka vypíše nalezené mosty – zkontroluj, že jsou to ty správné, a dej Stáhnout.</li>
-      <li>Stáhne se soubor <code>balicek_RRRR-MM-DD.json</code> (mostní list, vybrané prohlídky, případně náhledy fotek).</li>
-      <li>Soubor přenes do iPhonu (OneDrive, e-mail sobě, AirDrop z Macu…) a v aplikaci otevři <b>Data → Import balíčku z BMS</b>.</li>
+      <li>Přihlas se do <b>bms.clevera.cz</b>, nebo do <b>cev2.rsd.cz/bridge</b>.</li>
+      <li>Klikni na příslušnou záložku. Zadej ev. č. mostů, např. <code>605-026, 23617-1</code> (BMS) nebo <code>D8-030..1</code> (CEV2), a vyber prohlídky (poslední hlavní / mimořádná / běžná nebo všechny) a jestli s náhledy fotek.</li>
+      <li>Záložka vypíše nalezené mosty – zkontroluj, že jsou to ty správné. Pokud je poslední prohlídka nedokončená, vyber, jestli stáhnout poslední dokončenou, nedokončenou, nebo obě. Pak dej Stáhnout.</li>
+      <li>Stáhne se soubor <code>balicek_RRRR-MM-DD.json</code> (z CEV2 <code>balicek_CEV_RRRR-MM-DD.json</code>).</li>
+      <li>Soubor přenes do telefonu (OneDrive, e-mail sobě…) a v aplikaci otevři <b>Data → Import balíčku z BMS / CEV2</b>.</li>
     </ol>
-    <p class="muted">Záložka v BMS pouze čte data pod tvým přihlášením, nic neukládá ani neodesílá jinam. Využívá neveřejné rozhraní BMS – při změně na straně Clevery může přestat fungovat.</p>
+    <p class="muted">Záložky pouze čtou data pod tvým přihlášením, nic neukládají ani neodesílají jinam. Využívají neveřejné rozhraní BMS a CEV2 – při změně na straně provozovatele mohou přestat fungovat.</p>
   </div>
 </main>
 <script>
-fetch('bms-balicek.js', { cache: 'no-cache' }).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); }).then(t => {
-  document.getElementById('bm').href = 'javascript:' + encodeURIComponent(t.replace(/^\s*\/\*[\s\S]*?\*\/\s*/, ''));
-  document.getElementById('st').textContent = 'Připraveno. Kliknutí na tlačítko zde nic nedělá – je potřeba ho přetáhnout do záložek.';
-}).catch(e => {
-  document.getElementById('st').textContent = 'Chyba načtení bms-balicek.js (' + e.message + '). ' +
-    (location.protocol === 'file:' ? 'Stránka je otevřená ze souboru v PC – otevři ji z adresy https://martin-blatsky.github.io/prohlidky/bms.html.' : 'Obnov stránku (Ctrl+F5).');
-});
-document.getElementById('bm').addEventListener('click', e => e.preventDefault());
+function zalozka(soubor, a, st) {
+  fetch(soubor, { cache: 'no-cache' }).then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); }).then(t => {
+    document.getElementById(a).href = 'javascript:' + encodeURIComponent(t.replace(/^\s*\/\*[\s\S]*?\*\/\s*/, ''));
+    document.getElementById(st).textContent = 'Připraveno. Kliknutí na tlačítko zde nic nedělá – je potřeba ho přetáhnout do záložek.';
+  }).catch(e => {
+    document.getElementById(st).textContent = 'Chyba načtení ' + soubor + ' (' + e.message + '). ' +
+      (location.protocol === 'file:' ? 'Stránka je otevřená ze souboru v PC – otevři ji z adresy https://martin-blatsky.github.io/prohlidky/bms.html.' : 'Obnov stránku (Ctrl+F5).');
+  });
+  document.getElementById(a).addEventListener('click', e => e.preventDefault());
+}
+zalozka('bms-balicek.js', 'bm', 'st');
+zalozka('cev-balicek.js', 'bmc', 'stc');
 </script>
 </body>
 </html>
