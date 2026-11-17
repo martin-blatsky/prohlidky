@@ -1,7 +1,7 @@
 'use strict';
 /* Prohlídky mostů – PWA pro sběr fotodokumentace a závad v terénu.
    Data zůstávají v zařízení (IndexedDB), ven jen přes export ZIP. */
-const APP_VERSION = '0.8.1';
+const APP_VERSION = '0.8.2';
 const LEAF = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/';
 const MAXPX = 2048;          // delší strana zmenšené fotky [px]
 const TARGET = 550 * 1024;   // cílová velikost JPEG [B]
@@ -145,14 +145,24 @@ const ZAV = [ // [skupina, tlačítko, název, první číslice kódů BMS, výc
   ['2000', 'Spodní', 'Závada – spodní stavba', '1', '1.2'], ['3000', 'NK', 'Závada – nosná konstrukce', '2', '2.1'],
   ['4000', 'Přísl.', 'Závada – svršek a příslušenství', '345', '3.3'],
 ];
-// výběr kódu části: kódy zvolené skupiny nahoře (první předvybraný), ostatní pod nimi
-function codeOpts(g, sel) {
-  const z = ZAV.find(x => x[0] === g), opt = (c, n, s) => `<option value="${c}"${s ? ' selected' : ''}>${c} ${esc(n)}</option>`;
-  if (!z) return CODES.map(([c, n]) => opt(c, n, c === sel)).join('');
-  const mine = CODES.filter(([c]) => z[3].includes(c[0])), rest = CODES.filter(([c]) => !z[3].includes(c[0]));
-  sel = sel || z[4];
-  return `<optgroup label="${esc(z[2])} (${g.slice(0, 1)}001…)">${mine.map(([c, n]) => opt(c, n, c === sel)).join('')}</optgroup>
-    <optgroup label="Ostatní části">${rest.map(([c, n]) => opt(c, n, c === sel)).join('')}</optgroup>`;
+/* Závada nese jen řadu (část mostu). Kód BMS se nevybírá: v datech zůstává výchozí kód řady (ZAV[4]),
+   případně přesný kód převzatý ze závady minulé prohlídky – slouží jen k určení řady a k návrhům vět diktátu. */
+const grpName = c => ({ 2000: 'Spodní stavba', 3000: 'Nosná konstrukce', 4000: 'Svršek a příslušenství' })[c] || 'Nezařazeno';
+// volba řady závady: tlačítka + skryté pole #code (výchozí kód řady)
+function grpSeg(code) {
+  const cur = String(defCat(code));
+  return `<label>Část mostu</label><input type="hidden" id="code" value="${esc(code)}">
+    <div class="seg" id="zgrp">${ZAV.map(([g, t]) => `<button type="button" data-g="${g}" class="${g === cur ? 'pri' : ''}">${t} ${g}</button>`).join('')}</div>`;
+}
+function bindGrpSeg() {
+  const box = document.getElementById('zgrp'); if (!box) return () => {};
+  const mark = () => { const c = String(defCat($('#code').value)); box.querySelectorAll('[data-g]').forEach(x => x.classList.toggle('pri', x.dataset.g === c)); };
+  box.querySelectorAll('[data-g]').forEach(bt => bt.onclick = () => {
+    const z = ZAV.find(x => x[0] === bt.dataset.g);
+    if (String(defCat($('#code').value)) !== z[0]) $('#code').value = z[4]; // přesný kód z minula ponechat, pokud řada sedí
+    mark();
+  });
+  return mark;
 }
 const RADY = { 0: 'Povinné záběry', 100: 'Přehledné', 200: 'Spodní stavba', 300: 'Nosná konstrukce', 400: 'Příslušenství',
   2000: 'Závady – spodní stavba', 3000: 'Závady – nosná konstrukce', 4000: 'Závady – příslušenství', 9000: 'Nezařazené' };
@@ -701,7 +711,7 @@ async function vInsp(id) {
 
     <div class="card"><h2>Závady (${i.defects.length})</h2>
       ${i.defects.some(d => d.poloha) ? Nastroje.schema(supports(b), i.defects.map(d => ({ n: d.n, p: d.poloha }))) : ''}
-      <ul class="list">${i.defects.map(d => `<li><a class="grow" href="#/zavada/${id}/${d.id}"><b>č. ${d.n}</b> [${esc(d.code)}] ${esc(codeName(d.code))}${d.vyvoj ? ` <span class="badge">${esc(VYVOJ[d.vyvoj])}</span>` : ''}<div class="muted">${d.poloha ? esc(d.polohaText) + ' – ' : ''}${esc(d.popis).slice(0, 140) || '[doplnit popis]'}</div></a><span class="badge">${ph.filter(p => p.defectId === d.id).length} foto</span></li>`).join('') || '<li class="muted">Zatím žádné.</li>'}</ul>
+      <ul class="list">${i.defects.map(d => `<li><a class="grow" href="#/zavada/${id}/${d.id}"><b>č. ${d.n}</b> ${esc(grpName(defCat(d.code)))}${d.vyvoj ? ` <span class="badge">${esc(VYVOJ[d.vyvoj])}</span>` : ''}<div class="muted">${d.poloha ? esc(d.polohaText) + ' – ' : ''}${esc(d.popis).slice(0, 140) || '[doplnit popis]'}</div></a><span class="badge">${ph.filter(p => p.defectId === d.id).length} foto</span></li>`).join('') || '<li class="muted">Zatím žádné.</li>'}</ul>
       <button class="wide" id="newd" style="margin-top:8px">+ Závada bez fotky</button>
     </div>
 
@@ -758,12 +768,12 @@ function prevDefSelect(b, sel) {
   if (!b || !b.prev || !b.prev.zavady.length) return '';
   return `<label>Navázat na závadu z minulé prohlídky</label><select id="fromprev"><option value="">– nová závada –</option>${b.prev.zavady.map((z, k) => `<option value="${k}"${sel === k ? ' selected' : ''}>[${esc(z.code)}${z.pozice ? ' ' + esc(z.pozice) : ''}] ${esc(z.popis.slice(0, 70))}</option>`).join('')}</select>`;
 }
-function bindPrevDef(b, withOpat) {
+function bindPrevDef(b, withOpat, onCode) {
   const s = document.getElementById('fromprev'); if (!s) return;
   s.onchange = () => {
     const z = b.prev.zavady[+s.value]; if (!z) return;
-    const c = $('#code'); if (![...c.options].some(o => o.value === z.code)) c.add(new Option(z.code, z.code));
-    c.value = z.code;
+    if ($('#code')) $('#code').value = z.code;
+    if (onCode) onCode();
     $('#popis').value = z.popis;
     if (withOpat && $('#opat') && !$('#opat').value) $('#opat').value = z.opatreni.map(o => o.popis).join('\n');
   };
@@ -849,7 +859,7 @@ async function vCamera(inspId, key, defId, grp) {
   if (!dd) defId = null;
   const jn = JINE.find(x => x[0] === key), zv = key === 'zavada' && ZAV.find(x => x[0] === grp);
   if (!zv) grp = null;
-  const label = item ? item.cap : dd ? `Závada č. ${dd.n} [${dd.code}]` : zv ? `${zv[2]} (${grp})` : key === 'zavada' ? 'Závada' : jn ? `${jn[2]} (${key.slice(5)})` : 'Jiné foto';
+  const label = item ? item.cap : dd ? `Závada č. ${dd.n} – ${grpName(defCat(dd.code)).toLowerCase()}` : zv ? `${zv[2]} (${grp})` : key === 'zavada' ? 'Závada' : jn ? `${jn[2]} (${key.slice(5)})` : 'Jiné foto';
   hudCtx = { az: b.az };
   app.innerHTML = `<div class="cam">
     <video id="v" playsinline autoplay muted></video>
@@ -968,11 +978,10 @@ async function vPhoto(id, fromCam) {
     <div class="card" style="margin-top:12px">
       <label>Zařazení</label><select id="key">${keyOpts.map(([k, v]) => `<option value="${k}"${k === p.key ? ' selected' : ''}>${esc(v)}</option>`).join('')}</select>
       <div id="defbox" ${isDef ? '' : 'hidden'}>
-        <label>Závada</label><select id="def"><option value="">+ nová závada</option>${i.defects.map(d => `<option value="${d.id}"${d.id === p.defectId ? ' selected' : ''}>č. ${d.n} [${esc(d.code)}] ${esc(d.popis.slice(0, 40))}</option>`).join('')}</select>
+        <label>Závada</label><select id="def"><option value="">+ nová závada</option>${i.defects.map(d => `<option value="${d.id}"${d.id === p.defectId ? ' selected' : ''}>č. ${d.n} (${esc(grpName(defCat(d.code)))}) ${esc(d.popis.slice(0, 40))}</option>`).join('')}</select>
         <div id="newdef" ${p.defectId ? 'hidden' : ''}>
           ${prevDefSelect(b)}
-          ${p.grp ? `<details class="codebox"><summary>Kód části: <b id="codetx"></b> – změnit</summary><select id="code">${codeOpts(p.grp)}</select></details>`
-            : `<label>Část mostu (kód BMS)</label><select id="code">${codeOpts(p.grp)}</select>`}
+          ${p.grp ? `<input type="hidden" id="code" value="${ZAV.find(x => x[0] === p.grp)[4]}">` : grpSeg('2.1')}
           <label>Popis závady (diktuj mikrofonem na klávesnici)</label><textarea id="popis" placeholder="např. Podélná trhlina šířky cca 0,3 mm na podhledu NK v poli 2, délka cca 1,5 m."></textarea>
           ${polohaHtml(b, null)}
         </div>
@@ -1004,10 +1013,7 @@ async function vPhoto(id, fromCam) {
   Diktat.attach($('#popis'), 'def', () => $('#code').value);
   $('#key').onchange = syncKey;
   $('#def').onchange = () => { $('#newdef').hidden = !!$('#def').value; };
-  bindPrevDef(b);
-  const codeTx = () => { if ($('#codetx')) $('#codetx').textContent = `${$('#code').value} ${codeName($('#code').value)}`; };
-  codeTx(); $('#code').addEventListener('change', codeTx);
-  if ($('#fromprev')) $('#fromprev').addEventListener('change', codeTx);
+  bindPrevDef(b, false, bindGrpSeg());
   const getPol = bindPoloha(b, null);
   $('#draw').onclick = async () => {
     const out = await Nastroje.draw(p.blob); if (!out) return;
@@ -1072,7 +1078,7 @@ async function vDefect(inspId, defId) {
   const b = await get('bridges', i.bridgeId), nums = numberPhotos(i, b, all);
   app.innerHTML = `<div class="card">
     ${prevDefSelect(b, d.prevIdx)}
-    <label>Část mostu (kód BMS)</label><select id="code">${CODES.map(([c, n]) => `<option value="${c}"${c === d.code ? ' selected' : ''}>${c} ${esc(n)}</option>`).join('')}${CODES.some(x => x[0] === d.code) ? '' : `<option selected value="${esc(d.code)}">${esc(d.code)}</option>`}</select>
+    ${grpSeg(d.code)}
     ${b.prev ? `<label>Oproti minulé prohlídce</label><div class="seg" id="vyv">${Object.entries(VYVOJ).map(([k, t]) => `<button type="button" data-v="${k}" class="${d.vyvoj === k ? 'pri' : ''}">${t}</button>`).join('')}</div>` : ''}
     <label>Popis závady</label><textarea id="popis">${esc(d.popis)}</textarea>
     <label>Návrh opatření</label><textarea id="opat">${esc(d.opatreni)}</textarea>
@@ -1080,7 +1086,7 @@ async function vDefect(inspId, defId) {
     <div class="row" style="margin-top:12px"><button class="pri grow" id="save">Uložit</button><a class="btn" href="#/kamera/${inspId}?k=zavada&d=${d.id}" id="foto">📷 Přidat foto</a></div>
     <button class="bad wide" id="deld" style="margin-top:8px">Smazat závadu</button></div>
     <div class="card"><h2>Fotky (${ph.length})</h2><div class="grid">${ph.map(p => `<a class="thumb" href="#/foto/${p.id}"><img src="${blobUrl(p.blob)}" alt=""><span class="n">${nums.no.get(p.id) || '–'}</span></a>`).join('')}</div></div>`;
-  bindPrevDef(b, true);
+  bindPrevDef(b, true, bindGrpSeg());
   Diktat.attach($('#popis'), 'def', () => $('#code').value);
   Diktat.attach($('#opat'), 'opt', () => $('#code').value);
   const getPol = bindPoloha(b, d.poloha);
@@ -1147,10 +1153,11 @@ async function buildExport(i, b, ph) {
   if (i.casti && i.casti.length) i.casti.forEach(c => L.push('', `[${c.code}] ${c.nazev || codeName(c.code)}${c.pozice ? ' – ' + c.pozice : ''}`, c.popis || '[doplnit]'));
   else L.push('[doplnit]');
   L.push('', 'C. STAV A ZÁVADY ČÁSTÍ MOSTU');
-  const byCode = {};
-  [...i.defects].sort((a, c) => a.code.localeCompare(c.code, 'cs', { numeric: true }) || a.n - c.n).forEach(d => { (byCode[d.code] = byCode[d.code] || []).push(d); });
-  for (const [code, ds] of Object.entries(byCode)) {
-    L.push('', `[${code}] ${codeName(code)}`);
+  const byGrp = new Map(); // závady po řadách (spodní stavba, NK, svršek a příslušenství)
+  [...i.defects].sort((a, c) => defCat(a.code) - defCat(c.code) || a.n - c.n).forEach(d => {
+    const g = defCat(d.code); if (!byGrp.has(g)) byGrp.set(g, []); byGrp.get(g).push(d); });
+  for (const [g, ds] of byGrp) {
+    L.push('', grpName(g).toUpperCase());
     ds.forEach(d => {
       const f = ph.filter(p => p.defectId === d.id && photoNo.has(p.id)).map(p => photoNo.get(p.id)).sort((a, c) => a - c);
       const info = [d.polohaText && 'poloha: ' + d.polohaText, d.vyvoj && 'oproti minulé prohlídce: ' + VYVOJ[d.vyvoj], f.length && 'foto ' + f.join(', ')].filter(Boolean);
@@ -1168,8 +1175,8 @@ async function buildExport(i, b, ph) {
     if (bez.length) L.push('Neprojité v aplikaci:', ...bez);
   }
   L.push('', 'E. NÁVRH OPATŘENÍ');
-  const op = i.defects.filter(d => d.opatreni);
-  op.forEach(d => L.push(`[${d.code}] ${codeName(d.code)}: ${d.opatreni}`));
+  const op = i.defects.filter(d => d.opatreni).sort((a, c) => defCat(a.code) - defCat(c.code) || a.n - c.n);
+  op.forEach(d => L.push(`${grpName(defCat(d.code))}: ${d.opatreni}`));
   if (!op.length) L.push('[doplnit]');
   L.push('', 'J. OBRAZOVÉ PŘÍLOHY (číslo, popisek, soubor)', ...rows);
   const guessed = used.filter(p => p.key === 'jine');
