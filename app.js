@@ -1,7 +1,7 @@
 'use strict';
 /* Prohlídky mostů – PWA pro sběr fotodokumentace a závad v terénu.
    Data zůstávají v zařízení (IndexedDB), ven jen přes export ZIP. */
-const APP_VERSION = '0.8.0';
+const APP_VERSION = '0.8.1';
 const LEAF = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/';
 const MAXPX = 2048;          // delší strana zmenšené fotky [px]
 const TARGET = 550 * 1024;   // cílová velikost JPEG [B]
@@ -141,6 +141,19 @@ const JINE = [ // [klíč, tlačítko, název řady]
   ['jine-100', 'Přehled', 'Přehledné foto'], ['jine-200', 'Spodní', 'Spodní stavba'],
   ['jine-300', 'NK', 'Nosná konstrukce'], ['jine-400', 'Přísl.', 'Příslušenství'],
 ];
+const ZAV = [ // [skupina, tlačítko, název, první číslice kódů BMS, výchozí kód] – tlačítka závad předvolí kód části
+  ['2000', 'Spodní', 'Závada – spodní stavba', '1', '1.2'], ['3000', 'NK', 'Závada – nosná konstrukce', '2', '2.1'],
+  ['4000', 'Přísl.', 'Závada – svršek a příslušenství', '345', '3.3'],
+];
+// výběr kódu části: kódy zvolené skupiny nahoře (první předvybraný), ostatní pod nimi
+function codeOpts(g, sel) {
+  const z = ZAV.find(x => x[0] === g), opt = (c, n, s) => `<option value="${c}"${s ? ' selected' : ''}>${c} ${esc(n)}</option>`;
+  if (!z) return CODES.map(([c, n]) => opt(c, n, c === sel)).join('');
+  const mine = CODES.filter(([c]) => z[3].includes(c[0])), rest = CODES.filter(([c]) => !z[3].includes(c[0]));
+  sel = sel || z[4];
+  return `<optgroup label="${esc(z[2])} (${g.slice(0, 1)}001…)">${mine.map(([c, n]) => opt(c, n, c === sel)).join('')}</optgroup>
+    <optgroup label="Ostatní části">${rest.map(([c, n]) => opt(c, n, c === sel)).join('')}</optgroup>`;
+}
 const RADY = { 0: 'Povinné záběry', 100: 'Přehledné', 200: 'Spodní stavba', 300: 'Nosná konstrukce', 400: 'Příslušenství',
   2000: 'Závady – spodní stavba', 3000: 'Závady – nosná konstrukce', 4000: 'Závady – příslušenství', 9000: 'Nezařazené' };
 const defCat = code => ({ 1: 2000, 2: 3000, 3: 4000, 4: 4000, 5: 4000 })[String(code || '').trim()[0]] || 9000;
@@ -403,7 +416,7 @@ async function route() {
     if (p[0] === 'most' && p[2] === 'upravit') return await vBridgeEdit(p[1]);
     if (p[0] === 'most') return await vBridge(p[1]);
     if (p[0] === 'prohlidka') return await vInsp(p[1]);
-    if (p[0] === 'kamera') return await vCamera(p[1], qs.get('k') || 'jine', qs.get('d'));
+    if (p[0] === 'kamera') return await vCamera(p[1], qs.get('k') || 'jine', qs.get('d'), qs.get('g'));
     if (p[0] === 'kontrola') return await vCheck(p[1]);
     if (p[0] === 'foto') return await vPhoto(p[1], qs.get('dal') === '1');
     if (p[0] === 'zavada') return await vDefect(p[1], p[2]);
@@ -671,8 +684,8 @@ async function vInsp(id) {
       const pc = checkValid(i, b) ? i.prevCheck || {} : {}, done = b.prev.zavady.filter((z, k) => pc[k] && pc[k].st).length, tot = b.prev.zavady.length;
       return `<a class="btn wide" style="margin-bottom:12px" href="#/kontrola/${id}">Závady z minulé prohlídky <span class="badge ${done === tot ? 'ok' : 'miss'}">${done}/${tot}</span></a>`;
     })() : ''}
-    <div class="row" style="margin-bottom:6px">
-      <a class="btn pri grow" href="${camLink('zavada')}" data-cam>📷 Závada</a>
+    <div class="row cats" style="margin-bottom:6px">
+      ${ZAV.map(([g, t]) => `<a class="btn pri grow" href="${camLink('zavada')}&g=${g}" data-cam>📷 ${t}<small>závada ${g}</small></a>`).join('')}
     </div>
     <div class="row cats" style="margin-bottom:12px">
       ${JINE.map(([k, t]) => `<a class="btn grow" href="${camLink(k)}" data-cam>📷 ${t}<small>${k.slice(5)}</small></a>`).join('')}
@@ -829,13 +842,14 @@ async function vCheck(inspId) {
 }
 
 /* ---------- kamera ---------- */
-async function vCamera(inspId, key, defId) {
+async function vCamera(inspId, key, defId, grp) {
   const i = await get('insp', inspId), b = await get('bridges', i.bridgeId);
   const item = checklist(b, i.druh).find(t => t.key === key);
   const dd = defId && i.defects.find(x => x.id === defId);
   if (!dd) defId = null;
-  const jn = JINE.find(x => x[0] === key);
-  const label = item ? item.cap : dd ? `Závada č. ${dd.n} [${dd.code}]` : key === 'zavada' ? 'Závada' : jn ? `${jn[2]} (${key.slice(5)})` : 'Jiné foto';
+  const jn = JINE.find(x => x[0] === key), zv = key === 'zavada' && ZAV.find(x => x[0] === grp);
+  if (!zv) grp = null;
+  const label = item ? item.cap : dd ? `Závada č. ${dd.n} [${dd.code}]` : zv ? `${zv[2]} (${grp})` : key === 'zavada' ? 'Závada' : jn ? `${jn[2]} (${key.slice(5)})` : 'Jiné foto';
   hudCtx = { az: b.az };
   app.innerHTML = `<div class="cam">
     <video id="v" playsinline autoplay muted></video>
@@ -890,7 +904,7 @@ async function vCamera(inspId, key, defId) {
   $('#natl').addEventListener('click', () => { metaNat = snap(); metaNat.src = 'fotoaparat'; });
   $('#nat').onchange = async e => {
     const f = e.target.files[0]; if (!f) return;
-    await storePhoto(i, b, key, item, f, metaNat || snap(), defId);
+    await storePhoto(i, b, key, item, f, metaNat || snap(), defId, grp);
   };
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 3840 }, height: { ideal: 2160 } } });
@@ -906,10 +920,10 @@ async function vCamera(inspId, key, defId) {
     const c = document.createElement('canvas'); c.width = v.videoWidth; c.height = v.videoHeight;
     c.getContext('2d').drawImage(v, 0, 0);
     const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.95));
-    await storePhoto(i, b, key, item, blob, meta, defId);
+    await storePhoto(i, b, key, item, blob, meta, defId, grp);
   };
 }
-async function storePhoto(i, b, key, item, src, meta, defId) {
+async function storePhoto(i, b, key, item, src, meta, defId, grp) {
   toast('Ukládám…', 1500);
   const blob = await processImage(src, new Date(meta.ts));
   i = await get('insp', i.id);           // čerstvý stav (pořadí)
@@ -917,7 +931,7 @@ async function storePhoto(i, b, key, item, src, meta, defId) {
   await put('insp', i);
   const dir = dirWord(meta.heading, b.az);
   const p = { id: uid(), inspId: i.id, seq: i.nextSeq, key, blob, ...meta, dir, caption: defaultCaption(item, dir),
-    include: true, defectId: defId || null, audio: null, note: '' };
+    include: true, defectId: defId || null, grp: grp || null, audio: null, note: '' };
   await put('photos', p);
   location.hash = `#/foto/${p.id}?dal=1`;
 }
@@ -957,7 +971,8 @@ async function vPhoto(id, fromCam) {
         <label>Závada</label><select id="def"><option value="">+ nová závada</option>${i.defects.map(d => `<option value="${d.id}"${d.id === p.defectId ? ' selected' : ''}>č. ${d.n} [${esc(d.code)}] ${esc(d.popis.slice(0, 40))}</option>`).join('')}</select>
         <div id="newdef" ${p.defectId ? 'hidden' : ''}>
           ${prevDefSelect(b)}
-          <label>Část mostu (kód BMS)</label><select id="code">${CODES.map(([c, n]) => `<option value="${c}">${c} ${esc(n)}</option>`).join('')}</select>
+          ${p.grp ? `<details class="codebox"><summary>Kód části: <b id="codetx"></b> – změnit</summary><select id="code">${codeOpts(p.grp)}</select></details>`
+            : `<label>Část mostu (kód BMS)</label><select id="code">${codeOpts(p.grp)}</select>`}
           <label>Popis závady (diktuj mikrofonem na klávesnici)</label><textarea id="popis" placeholder="např. Podélná trhlina šířky cca 0,3 mm na podhledu NK v poli 2, délka cca 1,5 m."></textarea>
           ${polohaHtml(b, null)}
         </div>
@@ -990,6 +1005,9 @@ async function vPhoto(id, fromCam) {
   $('#key').onchange = syncKey;
   $('#def').onchange = () => { $('#newdef').hidden = !!$('#def').value; };
   bindPrevDef(b);
+  const codeTx = () => { if ($('#codetx')) $('#codetx').textContent = `${$('#code').value} ${codeName($('#code').value)}`; };
+  codeTx(); $('#code').addEventListener('change', codeTx);
+  if ($('#fromprev')) $('#fromprev').addEventListener('change', codeTx);
   const getPol = bindPoloha(b, null);
   $('#draw').onclick = async () => {
     const out = await Nastroje.draw(p.blob); if (!out) return;
@@ -1039,7 +1057,7 @@ async function vPhoto(id, fromCam) {
     if ($('#cap').dataset.auto === '0') Diktat.learn('cap', '', p.caption); // jen ručně upravené popisky
     return i2;
   };
-  if (fromCam) $('#savenext').onclick = async () => { await save(); location.hash = `#/kamera/${p.inspId}?k=${encodeURIComponent(p.key)}${p.defectId ? '&d=' + p.defectId : ''}`; };
+  if (fromCam) $('#savenext').onclick = async () => { await save(); location.hash = `#/kamera/${p.inspId}?k=${encodeURIComponent(p.key)}${p.defectId ? '&d=' + p.defectId : ''}${p.grp ? '&g=' + p.grp : ''}`; };
   $('#save').onclick = async () => { await save(); location.hash = `#/prohlidka/${p.inspId}`; };
   $('#delp').onclick = async () => { if (!confirm('Smazat fotku?')) return; await del('photos', id); location.hash = `#/prohlidka/${p.inspId}`; };
 }
