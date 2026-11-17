@@ -1,7 +1,7 @@
 'use strict';
 /* Prohlídky mostů – PWA pro sběr fotodokumentace a závad v terénu.
    Data zůstávají v zařízení (IndexedDB), ven jen přes export ZIP. */
-const APP_VERSION = '0.7.1';
+const APP_VERSION = '0.8.0';
 const LEAF = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/';
 const MAXPX = 2048;          // delší strana zmenšené fotky [px]
 const TARGET = 550 * 1024;   // cílová velikost JPEG [B]
@@ -133,6 +133,52 @@ function checklist(br, druh) {
   return it;
 }
 const groupIdx = key => { const g = String(key || '').split('-')[0]; const i = GROUPS.findIndex(x => x[0] === g); return i >= 0 ? i : key === 'zavada' ? 90 : 99; };
+
+/* Číslování fotek pro řazení v BMS (řady):
+   povinné záběry 01–99, přehledné 101…, spodní stavba 201…, nosná konstrukce 301…, příslušenství 401…,
+   závady podle kódu části BMS: 1.x → 2001…, 2.x → 3001…, 3.x / 4.x / 5 → 4001…, nezařazené 9001…. */
+const JINE = [ // [klíč, tlačítko, název řady]
+  ['jine-100', 'Přehled', 'Přehledné foto'], ['jine-200', 'Spodní', 'Spodní stavba'],
+  ['jine-300', 'NK', 'Nosná konstrukce'], ['jine-400', 'Přísl.', 'Příslušenství'],
+];
+const RADY = { 0: 'Povinné záběry', 100: 'Přehledné', 200: 'Spodní stavba', 300: 'Nosná konstrukce', 400: 'Příslušenství',
+  2000: 'Závady – spodní stavba', 3000: 'Závady – nosná konstrukce', 4000: 'Závady – příslušenství', 9000: 'Nezařazené' };
+const defCat = code => ({ 1: 2000, 2: 3000, 3: 4000, 4: 4000, 5: 4000 })[String(code || '').trim()[0]] || 9000;
+const jineFor = code => { const c = defCat(code); return c < 9000 ? 'jine-' + c / 10 : 'jine'; }; // fotky smazané závady
+// odhad řady podle popisku (fotky „Jiné“ bez zvolené řady, starší verze aplikace)
+function guessCat(cap) {
+  const s = String(cap || '');
+  if (/ložisk|závěr|podhled|\bNK\b|nosn|nosník|klenb|trám/i.test(s)) return 300;
+  if (/říms|zábradl|svodid|vozovk|chodník|odvodn|izolac|obrubn|značen|vpust|osvětl|cizí zaříz|vedení/i.test(s)) return 400;
+  if (/opěr|\bO?P\d|pilíř|křídl|základ|podpěr|čelní zd|úložn|kužel|svah/i.test(s)) return 200;
+  if (/pohled na most|pod most|přehled|celkov|prostorov/i.test(s)) return 100;
+  return 9000;
+}
+function photoCat(p, i) {
+  if (groupIdx(p.key) < GROUPS.length) return 0;
+  if (p.key === 'zavada') { const d = i.defects.find(x => x.id === p.defectId); return d ? defCat(d.code) : 9000; }
+  const m = /^jine-(\d+)$/.exec(p.key || '');
+  return m ? +m[1] : guessCat(p.caption);
+}
+// pořadí a čísla fotek ve zprávě; fotky mimo zprávu číslo nemají
+function numberPhotos(i, b, ph) {
+  const order = new Map(checklist(b, i.druh).map((t, k) => [t.key, k]));
+  const defN = new Map(i.defects.map(d => [d.id, d.n]));
+  const cat = new Map(ph.map(p => [p.id, photoCat(p, i)]));
+  const sorted = [...ph].sort((a, c) =>
+    cat.get(a.id) - cat.get(c.id) ||
+    groupIdx(a.key) - groupIdx(c.key) ||
+    (order.get(a.key) ?? 999) - (order.get(c.key) ?? 999) ||
+    (defN.get(a.defectId) ?? 0) - (defN.get(c.defectId) ?? 0) ||
+    a.seq - c.seq);
+  const no = new Map(), cnt = {}, over = new Set();
+  sorted.filter(p => p.include).forEach(p => {
+    const c = cat.get(p.id), k = cnt[c] = (cnt[c] || 0) + 1;
+    no.set(p.id, c + k);
+    if (k > (c < 1000 ? 99 : 999)) over.add(c);
+  });
+  return { sorted, no, cat, over };
+}
 
 /* Směr pohledu vůči staničení: heading = azimut osy kamery, az = azimut směru staničení. */
 function dirWord(heading, az) {
@@ -599,7 +645,7 @@ async function vInsp(id) {
   if (!i) { location.hash = '#/'; return; }
   const b = await get('bridges', i.bridgeId);
   const ph = (await photosOf(id)).sort((a, c) => a.seq - c.seq);
-  const items = checklist(b, i.druh);
+  const items = checklist(b, i.druh), nums = numberPhotos(i, b, ph);
   setTitle(`${b.evc} – ${DRUHY[i.druh]}`, `#/most/${b.id}`);
   const cnt = k => ph.filter(p => p.key === k).length;
   const missing = items.filter(t => !cnt(t.key) && !i.na[t.key]).length;
@@ -625,9 +671,11 @@ async function vInsp(id) {
       const pc = checkValid(i, b) ? i.prevCheck || {} : {}, done = b.prev.zavady.filter((z, k) => pc[k] && pc[k].st).length, tot = b.prev.zavady.length;
       return `<a class="btn wide" style="margin-bottom:12px" href="#/kontrola/${id}">Závady z minulé prohlídky <span class="badge ${done === tot ? 'ok' : 'miss'}">${done}/${tot}</span></a>`;
     })() : ''}
-    <div class="row" style="margin-bottom:12px">
+    <div class="row" style="margin-bottom:6px">
       <a class="btn pri grow" href="${camLink('zavada')}" data-cam>📷 Závada</a>
-      <a class="btn grow" href="${camLink('jine')}" data-cam>📷 Jiné foto</a>
+    </div>
+    <div class="row cats" style="margin-bottom:12px">
+      ${JINE.map(([k, t]) => `<a class="btn grow" href="${camLink(k)}" data-cam>📷 ${t}<small>${k.slice(5)}</small></a>`).join('')}
     </div>
 
     <div class="card"><h2>Povinné záběry (ČSN 73 6221, tab. 4) ${missing ? `<span class="badge miss">chybí ${missing}</span>` : '<span class="badge ok">kompletní</span>'}</h2>
@@ -645,7 +693,8 @@ async function vInsp(id) {
     </div>
 
     <div class="card"><h2>Fotky (${ph.length}, ve zprávě ${ph.filter(p => p.include).length})</h2>
-      <div class="grid">${ph.map(p => `<a class="thumb${p.include ? '' : ' off'}" href="#/foto/${p.id}"><img loading="lazy" src="${blobUrl(p.blob)}" alt=""><span class="n">${p.seq}</span><span class="cap">${esc(p.caption)}</span></a>`).join('')}</div>
+      ${ph.length ? '<p class="muted" style="margin:0 0 8px">Číslo v rohu = číslo fotky v exportu (povinné 01–99, přehledné 101…, spodní stavba 201…, NK 301…, příslušenství 401…, závady 2001… / 3001… / 4001…, nezařazené 9001…).</p>' : ''}
+      <div class="grid">${ph.map(p => `<a class="thumb${p.include ? '' : ' off'}" href="#/foto/${p.id}"><img loading="lazy" src="${blobUrl(p.blob)}" alt=""><span class="n${nums.cat.get(p.id) === 9000 ? ' warn' : ''}">${nums.no.get(p.id) || '–'}</span><span class="cap">${esc(p.caption)}</span></a>`).join('')}</div>
     </div>
 
     <div class="card"><h2>Export</h2>
@@ -768,8 +817,8 @@ async function vCheck(inspId) {
     } else {
       if (d) {
         const dp = (await photosOf(inspId)).filter(p => p.defectId === d.id);
-        if (!confirm(`Odebrat z této prohlídky závadu č. ${d.n}?${dp.length ? ` Její ${dp.length} fotky zůstanou jako „Jiné“.` : ''}`)) return;
-        for (const p of dp) { p.defectId = null; p.key = 'jine'; await put('photos', p); }
+        if (!confirm(`Odebrat z této prohlídky závadu č. ${d.n}?${dp.length ? ` Její ${dp.length} fotky zůstanou jako „Jiné“ v řadě podle části mostu.` : ''}`)) return;
+        for (const p of dp) { p.defectId = null; p.key = jineFor(d.code); await put('photos', p); }
         i.defects = i.defects.filter(x => x.id !== d.id);
       }
       i.prevCheck[k] = { st, defectId: null }; i.prevRef = refKey(b.prev);
@@ -785,7 +834,8 @@ async function vCamera(inspId, key, defId) {
   const item = checklist(b, i.druh).find(t => t.key === key);
   const dd = defId && i.defects.find(x => x.id === defId);
   if (!dd) defId = null;
-  const label = item ? item.cap : dd ? `Závada č. ${dd.n} [${dd.code}]` : key === 'zavada' ? 'Závada' : 'Jiné foto';
+  const jn = JINE.find(x => x[0] === key);
+  const label = item ? item.cap : dd ? `Závada č. ${dd.n} [${dd.code}]` : key === 'zavada' ? 'Závada' : jn ? `${jn[2]} (${key.slice(5)})` : 'Jiné foto';
   hudCtx = { az: b.az };
   app.innerHTML = `<div class="cam">
     <video id="v" playsinline autoplay muted></video>
@@ -892,9 +942,12 @@ async function vPhoto(id, fromCam) {
   if (!p) { location.hash = '#/'; return; }
   const i = await get('insp', p.inspId), b = await get('bridges', i.bridgeId);
   const items = checklist(b, i.druh);
-  setTitle(`Foto ${p.seq}`, `#/prohlidka/${i.id}`);
+  const nums = numberPhotos(i, b, await photosOf(i.id));
+  setTitle(`Foto ${nums.no.get(p.id) || '(mimo zprávu)'}`, `#/prohlidka/${i.id}`);
   const isDef = p.key === 'zavada';
-  const keyOpts = [...items.map(t => [t.key, t.cap]), ['zavada', 'Závada'], ['jine', 'Jiné']];
+  const keyOpts = [...items.map(t => [t.key, t.cap]), ['zavada', 'Závada (řada podle kódu části)'],
+    ...JINE.map(([k, , n]) => [k, `Jiné – ${n.toLowerCase()} (${k.slice(5)})`]),
+    ...(p.key === 'jine' ? [['jine', `Jiné – nezařazené (podle popisku: ${RADY[guessCat(p.caption)].toLowerCase()})`]] : [])];
   app.innerHTML = `
     <img class="preview" id="prev" src="${blobUrl(p.blob)}" alt="">
     <div class="row" style="margin-top:8px"><button class="grow" id="draw">✏️ Kreslit do fotky</button>${p.blobOrig ? '<button id="undraw">Vrátit původní</button>' : ''}</div>
@@ -996,9 +1049,9 @@ async function vDefect(inspId, defId) {
   const i = await get('insp', inspId);
   const d = i.defects.find(x => x.id === defId);
   if (!d) { location.hash = `#/prohlidka/${inspId}`; return; }
-  const ph = (await photosOf(inspId)).filter(p => p.defectId === defId).sort((a, b) => a.seq - b.seq);
+  const all = await photosOf(inspId), ph = all.filter(p => p.defectId === defId).sort((a, b) => a.seq - b.seq);
   setTitle(`Závada č. ${d.n}`, `#/prohlidka/${inspId}`);
-  const b = await get('bridges', i.bridgeId);
+  const b = await get('bridges', i.bridgeId), nums = numberPhotos(i, b, all);
   app.innerHTML = `<div class="card">
     ${prevDefSelect(b, d.prevIdx)}
     <label>Část mostu (kód BMS)</label><select id="code">${CODES.map(([c, n]) => `<option value="${c}"${c === d.code ? ' selected' : ''}>${c} ${esc(n)}</option>`).join('')}${CODES.some(x => x[0] === d.code) ? '' : `<option selected value="${esc(d.code)}">${esc(d.code)}</option>`}</select>
@@ -1008,7 +1061,7 @@ async function vDefect(inspId, defId) {
     ${polohaHtml(b, d.poloha)}
     <div class="row" style="margin-top:12px"><button class="pri grow" id="save">Uložit</button><a class="btn" href="#/kamera/${inspId}?k=zavada&d=${d.id}" id="foto">📷 Přidat foto</a></div>
     <button class="bad wide" id="deld" style="margin-top:8px">Smazat závadu</button></div>
-    <div class="card"><h2>Fotky (${ph.length})</h2><div class="grid">${ph.map(p => `<a class="thumb" href="#/foto/${p.id}"><img src="${blobUrl(p.blob)}" alt=""><span class="n">${p.seq}</span></a>`).join('')}</div></div>`;
+    <div class="card"><h2>Fotky (${ph.length})</h2><div class="grid">${ph.map(p => `<a class="thumb" href="#/foto/${p.id}"><img src="${blobUrl(p.blob)}" alt=""><span class="n">${nums.no.get(p.id) || '–'}</span></a>`).join('')}</div></div>`;
   bindPrevDef(b, true);
   Diktat.attach($('#popis'), 'def', () => $('#code').value);
   Diktat.attach($('#opat'), 'opt', () => $('#code').value);
@@ -1033,8 +1086,8 @@ async function vDefect(inspId, defId) {
   $('#save').onclick = async () => { await save(); location.hash = `#/prohlidka/${inspId}`; };
   $('#foto').addEventListener('click', async ev => { ensureSensors(); await save(); });
   $('#deld').onclick = async () => {
-    if (!confirm('Smazat závadu? Fotky zůstanou jako „Jiné“.')) return;
-    for (const p of ph) { p.defectId = null; p.key = 'jine'; await put('photos', p); }
+    if (!confirm('Smazat závadu? Fotky zůstanou jako „Jiné“ v řadě podle části mostu.')) return;
+    for (const p of ph) { p.defectId = null; p.key = jineFor(d.code); await put('photos', p); }
     if (i.prevCheck) for (const [k, c] of Object.entries(i.prevCheck)) if (c.defectId === defId) delete i.prevCheck[k];
     i.defects = i.defects.filter(x => x.id !== defId); await put('insp', i); location.hash = `#/prohlidka/${inspId}`;
   };
@@ -1042,26 +1095,23 @@ async function vDefect(inspId, defId) {
 
 /* ---------- export ---------- */
 async function buildExport(i, b, ph) {
-  const items = checklist(b, i.druh), order = new Map(items.map((t, k) => [t.key, k]));
-  const defN = new Map(i.defects.map(d => [d.id, d.n]));
-  const sorted = [...ph].sort((a, c) =>
-    groupIdx(a.key) - groupIdx(c.key) ||
-    (order.get(a.key) ?? 999) - (order.get(c.key) ?? 999) ||
-    (defN.get(a.defectId) ?? 0) - (defN.get(c.defectId) ?? 0) ||
-    a.seq - c.seq);
+  const items = checklist(b, i.druh);
+  const { sorted, no: photoNo, cat, over } = numberPhotos(i, b, ph);
   const used = sorted.filter(p => p.include), unused = sorted.filter(p => !p.include);
   // stejné popisky → " /1", " /2" (styl HPM)
   const capCount = {}; used.forEach(p => { capCount[p.caption] = (capCount[p.caption] || 0) + 1; });
   const capIdx = {};
   const finalCap = p => { if (capCount[p.caption] > 1) { capIdx[p.caption] = (capIdx[p.caption] || 0) + 1; return `${p.caption} /${capIdx[p.caption]}`; } return p.caption; };
-  const pre = slug(b.evc), files = [], rows = [], photoNo = new Map();
-  used.forEach((p, k) => {
-    const n = String(k + 1).padStart(2, '0'), cap = finalCap(p) || 'bez popisku';
+  const pre = slug(b.evc), files = [], rows = [];
+  let lastCat = null;
+  used.forEach(p => {
+    const no = photoNo.get(p.id), c = cat.get(p.id), cap = finalCap(p) || 'bez popisku';
+    const n = String(no).padStart(4, '0');  // 0001, 0101, 2001 – správné řazení i podle názvu souboru
     const name = `${n}_${pre}_${slug(cap)}.jpg`;
-    photoNo.set(p.id, k + 1);
     files.push({ name: `foto/${name}`, data: p.blob });
     if (p.audio) files.push({ name: `audio/${n}_${pre}.${/mp4|m4a|aac/.test(p.audio.type) ? 'm4a' : 'webm'}`, data: p.audio });
-    rows.push(`${n}\t${cap}\t${name}${p.note ? '\t(pozn.: ' + p.note + ')' : ''}`);
+    if (c !== lastCat) { rows.push(`-- ${RADY[c]} --`); lastCat = c; }
+    rows.push(`${String(no).padStart(2, '0')}\t${cap}\t${name}${p.note ? '\t(pozn.: ' + p.note + ')' : ''}`);
   });
   unused.forEach((p, k) => {
     const n = 'x' + String(k + 1).padStart(2, '0');
@@ -1103,7 +1153,13 @@ async function buildExport(i, b, ph) {
   const op = i.defects.filter(d => d.opatreni);
   op.forEach(d => L.push(`[${d.code}] ${codeName(d.code)}: ${d.opatreni}`));
   if (!op.length) L.push('[doplnit]');
-  L.push('', 'J. OBRAZOVÉ PŘÍLOHY (pořadí, popisek, soubor)', ...rows);
+  L.push('', 'J. OBRAZOVÉ PŘÍLOHY (číslo, popisek, soubor)', ...rows);
+  const guessed = used.filter(p => p.key === 'jine');
+  if (guessed.length) {
+    L.push('', 'ŘADA ODHADNUTÁ PODLE POPISKU (zkontroluj, případně změň Zařazení v detailu fotky)');
+    guessed.forEach(p => L.push(`- ${photoNo.get(p.id)} → ${RADY[cat.get(p.id)]}: ${p.caption || 'bez popisku'}`));
+  }
+  if (over.size) L.push('', `POZOR: přetečení řady ${[...over].map(c => RADY[c]).join(', ')} – víc než 99 (u závad 999) fotek, čísla zasahují do další řady.`);
   const miss = items.filter(t => !ph.some(p => p.key === t.key && p.include) && !i.na[t.key]);
   L.push('', 'KONTROLA FOTODOKUMENTACE (ČSN 73 6221, tab. 4 – doporučený rozsah)');
   if (miss.length) miss.forEach(t => L.push('- chybí: ' + t.cap));

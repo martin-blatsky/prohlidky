@@ -66,6 +66,10 @@ button.pri, .btn.pri { background: var(--acc2); border-color: var(--acc2); color
 button.bad { color: var(--bad); }
 button.small { min-height: 34px; padding: 4px 10px; font-size: 14px; }
 button.wide, .btn.wide { width: 100%; }
+.cats { gap: 6px; }
+.cats .btn { flex-direction: column; gap: 0; padding: 6px 4px; font-size: 14px; line-height: 1.2; white-space: nowrap; }
+.cats .btn small { color: var(--muted); font-size: 12px; }
+.thumb .n.warn { background: #b45309; }
 label { display: block; font-size: 14px; color: var(--muted); margin: 8px 0 4px; }
 input, select, textarea { font: inherit; width: 100%; padding: 10px; border: 1px solid var(--line);
   border-radius: 8px; background: var(--bg); color: var(--fg); }

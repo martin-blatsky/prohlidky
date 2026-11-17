@@ -1,5 +1,5 @@
 // Offline cache aplikace. Při změně souborů zvýšit verzi.
-const CACHE = 'prohlidky-v0.7.1';
+const CACHE = 'prohlidky-v0.8.0';
 const LIB = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/';
 const FILES = ['./', 'index.html', 'app.js', 'slovnik.js', 'diktat.js', 'nastroje.js', 'style.css', 'manifest.webmanifest', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES))); self.skipWaiting(); });
