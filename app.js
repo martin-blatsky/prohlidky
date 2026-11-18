@@ -1,7 +1,7 @@
 'use strict';
 /* Prohlídky mostů – PWA pro sběr fotodokumentace a závad v terénu.
    Data zůstávají v zařízení (IndexedDB), ven jen přes export ZIP. */
-const APP_VERSION = '0.8.2';
+const APP_VERSION = '0.8.3';
 const LEAF = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/';
 const MAXPX = 2048;          // delší strana zmenšené fotky [px]
 const TARGET = 550 * 1024;   // cílová velikost JPEG [B]
@@ -431,6 +431,7 @@ async function route() {
     if (p[0] === 'foto') return await vPhoto(p[1], qs.get('dal') === '1');
     if (p[0] === 'zavada') return await vDefect(p[1], p[2]);
     if (p[0] === 'data') return await vData();
+    if (p[0] === 'export') return await vBulk();
     if (p[0] === 'mapa') return await vMap(p[1] === 'vse');
     if (p[0] === 'minula') return await vPrev(p[1], qs.get('p'));
     if (p[0] === 'mostni-list') return await vList(p[1]);
@@ -448,13 +449,14 @@ async function vBridges() {
   const today = isoDay(Date.now());
   const bs = (await all('bridges')).sort((a, b) => (b.plan === today) - (a.plan === today) || String(a.evc).localeCompare(String(b.evc), 'cs', { numeric: true }));
   const ins = await all('insp');
-  const nToday = bs.filter(b => b.plan === today).length;
+  const nToday = bs.filter(b => b.plan === today).length, nOpen = ins.filter(i => !i.exportedAt).length;
   app.innerHTML = `
     <div class="row" style="margin-bottom:12px">
       <a class="btn pri grow" href="#/most/novy">+ Nový most</a>
       <a class="btn" href="#/mapa${nToday ? '' : '/vse'}">🗺 Mapa</a>
       <a class="btn" href="#/data">Data</a>
     </div>
+    ${ins.length ? `<a class="btn wide" style="margin-bottom:12px" href="#/export">Hromadný export prohlídek ${nOpen ? `<span class="badge miss">neexp. ${nOpen}</span>` : ''}</a>` : ''}
     <div class="card">${bs.length ? `<p class="muted" style="margin:0 0 4px">Tlačítkem „dnes“ označ mosty, na které dnes jedeš – zobrazí se nahoře a na mapě.</p><ul class="list">${bs.map(b => {
       const n = ins.filter(i => i.bridgeId === b.id), open = n.filter(i => !i.exportedAt).length, pl = b.plan === today;
       return `<li><a class="grow" href="#/most/${b.id}"><b>${esc(b.evc)}</b> ${esc(b.nazev)}<div class="muted">${b.poli || 1} ${(b.poli | 0) > 1 ? 'polí' : 'pole'}${n.length ? ` · prohlídek ${n.length}` : ''}${b.lat == null ? ' · bez souřadnic' : ''}</div></a>${open ? `<span class="badge miss">neexp. ${open}</span>` : ''}<button class="small${pl ? ' pri' : ''}" data-plan="${b.id}">${pl ? '✓ dnes' : 'dnes'}</button></li>`;
@@ -1118,7 +1120,7 @@ async function vDefect(inspId, defId) {
 }
 
 /* ---------- export ---------- */
-async function buildExport(i, b, ph) {
+async function buildExport(i, b, ph, raw) {
   const items = checklist(b, i.druh);
   const { sorted, no: photoNo, cat, over } = numberPhotos(i, b, ph);
   const used = sorted.filter(p => p.include), unused = sorted.filter(p => !p.include);
@@ -1195,7 +1197,67 @@ async function buildExport(i, b, ph) {
   const meta = { app: APP_VERSION, bridge: b, inspection: i,
     photos: sorted.map(p => ({ ...p, blob: undefined, blobOrig: undefined, kresba: !!p.blobOrig, audio: !!p.audio, cislo: photoNo.get(p.id) || null })) };
   files.push({ name: 'data.json', data: JSON.stringify(meta, null, 1) });
-  return { blob: await makeZip(files), name: `${pre}_${i.druh}_${i.datum}.zip` };
+  const base = `${pre}_${i.druh}_${i.datum}`;
+  if (raw) return { files, base };  // pro hromadný export
+  return { blob: await makeZip(files), name: base + '.zip' };
+}
+
+/* ---------- hromadný export: vybrané prohlídky do jednoho ZIPu, každá ve vlastní složce ---------- */
+async function vBulk() {
+  setTitle('Hromadný export', '#/');
+  const bs = new Map((await all('bridges')).map(b => [b.id, b]));
+  const ins = (await all('insp')).filter(i => bs.has(i.bridgeId))
+    .sort((a, c) => String(c.datum).localeCompare(String(a.datum)) || String(bs.get(a.bridgeId).evc).localeCompare(String(bs.get(c.bridgeId).evc), 'cs', { numeric: true }));
+  if (!ins.length) { app.innerHTML = '<div class="card"><p class="muted">Žádné prohlídky.</p></div>'; return; }
+  const size = new Map();
+  for (const i of ins) size.set(i.id, (await photosOf(i.id)).reduce((s, p) => s + (p.blob ? p.blob.size : 0) + (p.audio ? p.audio.size : 0), 0));
+  const MB = x => num(x / 1048576, 1) + ' MB';
+  const pr = n => `${n} ${n === 1 ? 'prohlídka' : n >= 2 && n <= 4 ? 'prohlídky' : 'prohlídek'}`;
+  app.innerHTML = `
+    <div class="card"><p class="muted" style="margin-top:0">Vybrané prohlídky se uloží do jednoho ZIPu, každá do vlastní složky se stejným obsahem jako samostatný export (foto, prohlidka.txt, data.json…). Předvybrané jsou neexportované.</p>
+      <div class="row"><button class="small" id="selopen">Neexportované</button><button class="small" id="selall">Vše</button><button class="small" id="selnone">Nic</button></div>
+      <ul class="list">${ins.map(i => { const b = bs.get(i.bridgeId); return `<li><label class="grow" style="display:flex;gap:10px;align-items:center;margin:0;color:var(--fg)">
+        <input type="checkbox" data-i="${i.id}" ${i.exportedAt ? '' : 'checked'}><span><b>${esc(b.evc)}</b> ${esc(DRUHY[i.druh])} – ${fmtDate(i.datum)}<div class="muted">${esc(b.nazev)} · ${MB(size.get(i.id))}</div></span></label>
+        ${i.exportedAt ? '<span class="badge ok">export</span>' : '<span class="badge miss">neexp.</span>'}</li>`; }).join('')}</ul>
+      <p class="muted" id="bsum"></p>
+      <button class="pri wide" id="bexp">Exportovat vybrané</button>
+    </div>`;
+  const boxes = () => [...app.querySelectorAll('[data-i]')];
+  const upd = () => {
+    const sel = boxes().filter(x => x.checked), tot = sel.reduce((s, x) => s + size.get(x.dataset.i), 0);
+    $('#bsum').textContent = `Vybráno: ${pr(sel.length)}, cca ${MB(tot)}.` + (tot > 400 * 1048576 ? ' Velký ZIP – telefon na něj nemusí mít paměť, raději exportuj po částech.' : '');
+    $('#bexp').disabled = !sel.length;
+  };
+  boxes().forEach(x => x.onchange = upd);
+  $('#selopen').onclick = () => { boxes().forEach(x => { x.checked = !ins.find(i => i.id === x.dataset.i).exportedAt; }); upd(); };
+  $('#selall').onclick = () => { boxes().forEach(x => { x.checked = true; }); upd(); };
+  $('#selnone').onclick = () => { boxes().forEach(x => { x.checked = false; }); upd(); };
+  upd();
+  $('#bexp').onclick = async () => {
+    const ids = boxes().filter(x => x.checked).map(x => x.dataset.i), bt = $('#bexp');
+    bt.disabled = true;
+    try {
+      const files = [], used = new Set(), done = [];
+      for (const [k, id] of ids.entries()) {
+        bt.textContent = `Připravuji ${k + 1}/${ids.length}…`;
+        const i = await get('insp', id), b = bs.get(i.bridgeId);
+        const r = await buildExport(i, b, await photosOf(id), true);
+        let dir = r.base, n = 2; while (used.has(dir)) dir = `${r.base}_${n++}`; used.add(dir);
+        r.files.forEach(f => files.push({ name: `${dir}/${f.name}`, data: f.data }));
+        done.push(i);
+      }
+      bt.textContent = 'Balím ZIP…';
+      const zip = await makeZip(files), name = `prohlidky_${isoDay(Date.now())}.zip`;
+      // sdílení na iOS potřebuje čerstvé klepnutí – po delší přípravě proto samostatné tlačítko
+      bt.textContent = `💾 Uložit ZIP (${pr(done.length)}, ${MB(zip.size)})`; bt.disabled = false;
+      bt.onclick = async () => {
+        if (await saveFile(zip, name)) {
+          const t = Date.now(); for (const i of done) { const c = await get('insp', i.id); c.exportedAt = t; await put('insp', c); }
+          toast(`Exportováno: ${pr(done.length)}`); route();
+        }
+      };
+    } catch (e) { toast('Export selhal: ' + e.message, 5000); route(); }
+  };
 }
 
 /* ---------- data: import/záloha mostů ---------- */
