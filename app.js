@@ -1,7 +1,7 @@
 'use strict';
 /* Prohlídky mostů – PWA pro sběr fotodokumentace a závad v terénu.
    Data zůstávají v zařízení (IndexedDB), ven jen přes export ZIP. */
-const APP_VERSION = '0.8.3';
+const APP_VERSION = '0.8.4';
 const LEAF = 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/';
 const MAXPX = 2048;          // delší strana zmenšené fotky [px]
 const TARGET = 550 * 1024;   // cílová velikost JPEG [B]
@@ -342,6 +342,7 @@ function hud() {
 }
 
 /* ---------- zpracování fotky ---------- */
+// zmenšení fotky; datum se do fotky vkládá až při exportu (stampBlob), aby šlo nastavit „Datum na fotkách“
 async function processImage(src, date) {
   const bmp = await createImageBitmap(src);
   const s = Math.min(1, MAXPX / Math.max(bmp.width, bmp.height));
@@ -350,17 +351,35 @@ async function processImage(src, date) {
   const g = c.getContext('2d');
   g.drawImage(bmp, 0, 0, w, h);
   if (bmp.close) bmp.close();
-  // datum pořízení do pravého dolního rohu (ČSN 73 6221, 9.1.8)
+  if (date) drawStamp(g, w, h, date);
+  return encodeJpeg(c);
+}
+async function encodeJpeg(c) {
+  let q = 0.86, b;
+  do { b = await new Promise(r => c.toBlob(r, 'image/jpeg', q)); q -= 0.06; } while (b.size > TARGET && q > 0.45);
+  return b;
+}
+// datum do pravého dolního rohu (ČSN 73 6221, 9.1.8)
+function drawStamp(g, w, h, date) {
   const fs = Math.round(Math.max(w, h) * 0.028), txt = fmtDate(date);
   g.font = `bold ${fs}px -apple-system, Helvetica, Arial, sans-serif`;
   g.textAlign = 'right'; g.textBaseline = 'bottom';
   g.lineWidth = Math.max(2, fs * 0.16); g.strokeStyle = '#000'; g.lineJoin = 'round';
   g.strokeText(txt, w - fs * 0.6, h - fs * 0.45);
   g.fillStyle = '#ffd400'; g.fillText(txt, w - fs * 0.6, h - fs * 0.45);
-  let q = 0.86, b;
-  do { b = await new Promise(r => c.toBlob(r, 'image/jpeg', q)); q -= 0.06; } while (b.size > TARGET && q > 0.45);
-  return b;
 }
+async function stampBlob(blob, date) {
+  const bmp = await createImageBitmap(blob);
+  const c = document.createElement('canvas'); c.width = bmp.width; c.height = bmp.height;
+  const g = c.getContext('2d'); g.drawImage(bmp, 0, 0); if (bmp.close) bmp.close();
+  drawStamp(g, c.width, c.height, date);
+  return encodeJpeg(c);
+}
+// datum, které má být na fotce: „Datum na fotkách“ z údajů o prohlídce, jinak den pořízení
+const isoToDate = s => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || ''); return m ? new Date(+m[1], m[2] - 1, +m[3]) : null; };
+const photoDate = (p, i) => isoToDate(i.fotoDatum) || new Date(p.ts);
+// fotka pro export: nové fotky (bez data) dostanou datum teď, starší mají datum vložené už z pořízení
+const exportBlob = (p, i) => p.bare ? stampBlob(p.blob, photoDate(p, i)) : Promise.resolve(p.blob);
 
 /* ---------- ZIP (bez komprese, bez knihoven) ---------- */
 const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
@@ -679,6 +698,8 @@ async function vInsp(id) {
     <div class="card"><details><summary>Údaje o prohlídce</summary>
       <label>Datum</label><input id="datum" type="date" value="${i.datum}">
       <label>Druh</label><select id="druh">${Object.entries(DRUHY).map(([k, v]) => `<option value="${k}"${k === i.druh ? ' selected' : ''}>${v}</option>`).join('')}</select>
+      <label>Datum na fotkách</label><div class="row"><input id="fdat" type="date" class="grow" value="${esc(i.fotoDatum || '')}"><button type="button" class="small" id="fdatp">= datum prohlídky</button><button type="button" class="small" id="fdatx">Vymazat</button></div>
+      <p class="muted" style="margin:4px 0 0">Prázdné = na každé fotce den, kdy byla pořízena. Datum se do fotek vkládá až při exportu, jde tedy změnit kdykoli${ph.some(p => !p.bare) ? ' (kromě fotek ze starší verze aplikace, ty mají datum pořízení už vložené)' : ''}.</p>
       <label>Počasí</label><input id="pocasi" value="${esc(i.pocasi)}">
       <div class="row"><div class="grow"><label>Teplota vzduchu [°C]</label><input id="tVzd" inputmode="decimal" value="${esc(i.tVzd)}"></div>
       <div class="grow"><label>Teplota NK [°C]</label><input id="tNK" inputmode="decimal" value="${esc(i.tNK)}"></div></div>
@@ -732,9 +753,11 @@ async function vInsp(id) {
     await put('insp', i); route();
   });
   $('#savei').onclick = async () => {
-    Object.assign(i, { datum: $('#datum').value || i.datum, druh: $('#druh').value, pocasi: $('#pocasi').value, tVzd: $('#tVzd').value, tNK: $('#tNK').value, zpristupneni: $('#zpr').value });
+    Object.assign(i, { datum: $('#datum').value || i.datum, fotoDatum: $('#fdat').value, druh: $('#druh').value, pocasi: $('#pocasi').value, tVzd: $('#tVzd').value, tNK: $('#tNK').value, zpristupneni: $('#zpr').value });
     await put('insp', i); toast('Uloženo'); route();
   };
+  $('#fdatp').onclick = () => { $('#fdat').value = $('#datum').value; };
+  $('#fdatx').onclick = () => { $('#fdat').value = ''; };
   $('#wx').onclick = async () => {
     const lat = b.lat != null ? b.lat : S.lat, lon = b.lon != null ? b.lon : S.lon;
     if (lat == null) return toast('Most nemá souřadnice a GPS není zapnuté.');
@@ -937,13 +960,13 @@ async function vCamera(inspId, key, defId, grp) {
 }
 async function storePhoto(i, b, key, item, src, meta, defId, grp) {
   toast('Ukládám…', 1500);
-  const blob = await processImage(src, new Date(meta.ts));
+  const blob = await processImage(src, null); // bez data – vloží se při exportu
   i = await get('insp', i.id);           // čerstvý stav (pořadí)
   i.nextSeq = (i.nextSeq || 0) + 1;
   await put('insp', i);
   const dir = dirWord(meta.heading, b.az);
   const p = { id: uid(), inspId: i.id, seq: i.nextSeq, key, blob, ...meta, dir, caption: defaultCaption(item, dir),
-    include: true, defectId: defId || null, grp: grp || null, audio: null, note: '' };
+    include: true, defectId: defId || null, grp: grp || null, audio: null, note: '', bare: true };
   await put('photos', p);
   location.hash = `#/foto/${p.id}?dal=1`;
 }
@@ -1001,6 +1024,7 @@ async function vPhoto(id, fromCam) {
     </div>
     <div class="card"><div class="kv">
       <b>Pořízeno</b><span>${fmtDate(p.ts)} ${fmtTime(p.ts)} (${p.src === 'fotoaparat' ? 'Fotoaparát iOS – azimut z okamžiku otevření' : 'kamera v aplikaci'})</span>
+      <b>Datum na fotce</b><span>${p.bare ? `${fmtDate(photoDate(p, i))} – vloží se při exportu${i.fotoDatum ? ' (Datum na fotkách v údajích o prohlídce)' : ''}` : `${fmtDate(p.ts)} – vložené při pořízení (starší verze)`}</span>
       <b>GPS</b><span>${p.lat != null ? `${num(p.lat, 6)}, ${num(p.lon, 6)} ±${Math.round(p.acc)} m` : '–'}</span>
       <b>Azimut</b><span>${p.heading != null ? Math.round(p.heading) + '°' : '–'}${p.dir ? ' → ' + p.dir : ''}</span>
       <b>Velikost</b><span>${num(p.blob.size / 1024, 0)} kB</span>
@@ -1130,20 +1154,20 @@ async function buildExport(i, b, ph, raw) {
   const finalCap = p => { if (capCount[p.caption] > 1) { capIdx[p.caption] = (capIdx[p.caption] || 0) + 1; return `${p.caption} /${capIdx[p.caption]}`; } return p.caption; };
   const pre = slug(b.evc), files = [], rows = [];
   let lastCat = null;
-  used.forEach(p => {
+  for (const p of used) {
     const no = photoNo.get(p.id), c = cat.get(p.id), cap = finalCap(p) || 'bez popisku';
     const n = String(no).padStart(4, '0');  // 0001, 0101, 2001 – správné řazení i podle názvu souboru
     const name = `${n}_${pre}_${slug(cap)}.jpg`;
-    files.push({ name: `foto/${name}`, data: p.blob });
+    files.push({ name: `foto/${name}`, data: await exportBlob(p, i) });
     if (p.audio) files.push({ name: `audio/${n}_${pre}.${/mp4|m4a|aac/.test(p.audio.type) ? 'm4a' : 'webm'}`, data: p.audio });
     if (c !== lastCat) { rows.push(`-- ${RADY[c]} --`); lastCat = c; }
     rows.push(`${String(no).padStart(2, '0')}\t${cap}\t${name}${p.note ? '\t(pozn.: ' + p.note + ')' : ''}`);
-  });
-  unused.forEach((p, k) => {
+  }
+  for (const [k, p] of unused.entries()) {
     const n = 'x' + String(k + 1).padStart(2, '0');
-    files.push({ name: `nepouzite/${n}_${pre}_${slug(p.caption || 'foto')}.jpg`, data: p.blob });
+    files.push({ name: `nepouzite/${n}_${pre}_${slug(p.caption || 'foto')}.jpg`, data: await exportBlob(p, i) });
     if (p.audio) files.push({ name: `audio/${n}_${pre}.m4a`, data: p.audio });
-  });
+  }
   const L = [];
   L.push(`${DRUHY[i.druh].toUpperCase()} PROHLÍDKA – most ev. č. ${b.evc} ${b.nazev}`);
   L.push(`Datum provedení prohlídky: ${fmtDate(i.datum)}`);
@@ -1185,6 +1209,10 @@ async function buildExport(i, b, ph, raw) {
   if (guessed.length) {
     L.push('', 'ŘADA ODHADNUTÁ PODLE POPISKU (zkontroluj, případně změň Zařazení v detailu fotky)');
     guessed.forEach(p => L.push(`- ${photoNo.get(p.id)} → ${RADY[cat.get(p.id)]}: ${p.caption || 'bez popisku'}`));
+  }
+  if (i.fotoDatum) {
+    const old = used.filter(p => !p.bare && isoDay(p.ts) !== i.fotoDatum);
+    L.push('', `Datum na fotkách: ${fmtDate(isoToDate(i.fotoDatum))}` + (old.length ? ` – POZOR: fotky ${old.map(p => photoNo.get(p.id)).join(', ')} jsou ze starší verze aplikace a mají vložené datum pořízení, nejde změnit.` : ''));
   }
   if (over.size) L.push('', `POZOR: přetečení řady ${[...over].map(c => RADY[c]).join(', ')} – víc než 99 (u závad 999) fotek, čísla zasahují do další řady.`);
   const miss = items.filter(t => !ph.some(p => p.key === t.key && p.include) && !i.na[t.key]);
