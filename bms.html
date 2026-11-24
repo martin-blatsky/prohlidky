@@ -16,6 +16,8 @@
     <p class="muted" id="st">Načítám…</p>
     <p><a class="btn pri" id="bmc" href="#">⬇ Balíček z CEV2</a> <span class="muted">pro cev2.rsd.cz/bridge (ŘSD)</span></p>
     <p class="muted" id="stc">Načítám…</p>
+    <p><a class="btn pri" id="bmv" href="#">✎ Vyplnit prohlídku</a> <span class="muted">zápis do otevřené nedokončené prohlídky v BMS i CEV2 (z vyplneni.json / data.json a fotek exportu)</span></p>
+    <p class="muted" id="stv">Načítám…</p>
   </div>
   <div class="card">
     <h2>2. Použití</h2>
@@ -42,6 +44,7 @@ function zalozka(soubor, a, st) {
 }
 zalozka('bms-balicek.js', 'bm', 'st');
 zalozka('cev-balicek.js', 'bmc', 'stc');
+zalozka('prohlidka-vyplnit.js', 'bmv', 'stv');
 </script>
 </body>
 </html>
