@@ -3,7 +3,9 @@
    Vstup: vyplneni.json (z pracovního protokolu) nebo data.json z exportu aplikace Prohlídky mostů
           + volitelně fotky ze složky foto/ exportu (párují se podle čísla na začátku názvu souboru).
    Zápis jde stejným voláním jako dialogy stránky (UpdateProhlidkaDetail, InspectionUpload).
-   Nic nemaže a nepřepisuje: části a závady jen přidává, základní údaje doplní jen zaškrtnutá pole.
+   Zápis nic nemaže a nepřepisuje: části a závady jen přidává, základní údaje doplní jen zaškrtnutá pole.
+   Režim „Smazat vložené“ smaže vybrané části / závady / přílohy (předvybrané jsou ty, které vložila záložka),
+   jen v nedokončené prohlídce a po potvrzení v okně. Prohlídku nikdy nedokončuje ani neschvaluje.
    Stavební stav, použitelnost a zatížitelnost nezapisuje – ty volí prohlížející sám. */
 (async () => {
   const H = location.host;
@@ -21,16 +23,21 @@
     const j = await r.json(); if (j && j.ErrorMessage) throw new Error(j.ErrorMessage === 'NotLoggedIn' ? `nejsi přihlášený do ${SYS.n}` : j.ErrorMessage); return j;
   };
   const get = u => fetch(API + u, { credentials: 'same-origin' }).then(chk);
-  // POJISTKA: záložka smí volat jen UpdateProhlidkaDetail; nikdy nedokončuje, neschvaluje, nepřebírá ani nemaže.
+  // POJISTKA: záložka smí volat jen UpdateProhlidkaDetail; nikdy nedokončuje, neschvaluje ani nepřebírá.
+  // Mazání (JeSmazan: true) jen v režimu „Smazat vložené“ po potvrzení v okně.
   const ZAKAZ = ['Dokonceni', 'Autorizace', 'Prevzeti', 'DokonceniAutorizace'];
-  const post = (u, body) => {
+  const post = (u, body, smazat = false) => {
     if (u !== '/inspectiondata/UpdateProhlidkaDetail') return Promise.reject(new Error('nepovolené volání ' + u));
     const s = JSON.stringify(body);
-    if (/"JeSmazan":true/.test(s)) return Promise.reject(new Error('pojistka: mazání není povoleno'));
+    if (!smazat && /"JeSmazan":true/.test(s)) return Promise.reject(new Error('pojistka: mazání není povoleno'));
     if (ZAKAZ.some(k => new RegExp('"' + k + '"\\s*:').test(s))) return Promise.reject(new Error('pojistka: dokončení / schválení není povoleno'));
     return fetch(API + u, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: s }).then(chk);
   };
-  const upd = body => post('/inspectiondata/UpdateProhlidkaDetail', body);
+  const upd = (body, smazat) => post('/inspectiondata/UpdateProhlidkaDetail', body, smazat);
+  // záznam toho, co záložka do prohlídky vložila (v prohlížeči, localStorage stránky BMS / CEV2)
+  const RK = `pvy:${SYS.n}:${PG}`;
+  const rec = () => { try { return JSON.parse(localStorage.getItem(RK)) || { casti: [], zavady: [], prilohy: [] }; } catch (e) { return { casti: [], zavady: [], prilohy: [] }; } };
+  const recAdd = (k, g) => { if (!g) return; const r = rec(); if (!r[k].includes(g)) r[k].push(g); r.kdy = new Date().toISOString(); try { localStorage.setItem(RK, JSON.stringify(r)); } catch (e) { } };
   const detail = () => get(`/inspectiondata/GetProhlidkaDetail?guidId=${PG}`);
   const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const html = t => String(t || '').trim().split(/\n{2,}/).map(p => '<p>' + esc(p).replace(/\n/g, '<br/>') + '</p>').join('');
@@ -98,7 +105,8 @@
       <label style="margin-top:10px"><b>1. Data prohlídky</b> – vyplneni.json (protokol) nebo data.json (export aplikace)<br><input type="file" id="pvy-j" accept=".json,application/json"></label>
       <label><b>2. Fotky</b> (nepovinné) – vyber všechny soubory ze složky <code>foto</code> exportu (Ctrl+A)<br><input type="file" id="pvy-f" accept="image/jpeg,image/png" multiple></label>
       <div class="m">Po výběru se zobrazí náhled. Do ${SYS.n} se nic nezapíše, dokud nedáš „Zapsat“.</div>
-      <div class="row"><button class="p" id="pvy-go" disabled>Náhled</button></div>`);
+      <div class="row"><button id="pvy-del" style="margin-right:auto">Smazat vložené…</button><button class="p" id="pvy-go" disabled>Náhled</button></div>`);
+    ui.querySelector('#pvy-del').onclick = stepDel;
     const jIn = ui.querySelector('#pvy-j'), fIn = ui.querySelector('#pvy-f'), go = ui.querySelector('#pvy-go');
     jIn.onchange = () => { go.disabled = !jIn.files.length; };
     go.onclick = async () => {
@@ -198,7 +206,7 @@
         }
         const D2 = await detail();
         const pl = ((D2.RozsireneUdaje || {}).PrilohaList || []).filter(a => !a.JeSmazan);
-        fot.forEach(f => { const a = pl.find(a => a.Soubor === FILES[f.cislo].name); if (a) fotoGuid[f.cislo] = a.GuidId; });
+        fot.forEach(f => { const a = pl.find(a => a.Soubor === FILES[f.cislo].name); if (a) { fotoGuid[f.cislo] = a.GuidId; recAdd('prilohy', a.GuidId); } });
         log(`fotky v ${SYS.n} dohledány: ${Object.keys(fotoGuid).length}/${fot.length}`);
       }
       // 3) části objektu (jedna část na kód + pozici; popisy B stejného kódu se spojí)
@@ -222,7 +230,7 @@
         log(`✓ část ${p.code}${p.pozice ? ' – ' + p.pozice : ''}`);
       }
       const D3 = await detail(); RU.ObjektCastList = (D3.RozsireneUdaje || {}).ObjektCastList || [];
-      for (const [k, p] of need) if (!p.guid) { const c = exist().find(c => c.CastObjektuGuidId === castByCode[p.code].GuidId && norm(c.PoziceText) === norm(p.pozice)); p.guid = c && c.GuidId; }
+      for (const [k, p] of need) if (!p.guid) { const c = exist().find(c => c.CastObjektuGuidId === castByCode[p.code].GuidId && norm(c.PoziceText) === norm(p.pozice)); p.guid = c && c.GuidId; recAdd('casti', p.guid); }
       // 4) závady s opatřeními a fotkami
       for (const d of zs) {
         const p = need.get(key(d.code, d.pozice));
@@ -236,11 +244,69 @@
           // nová závada musí mít GUID z klienta (stránka: getNewGuid), jinak ji server tiše zahodí
           await upd({ GuidId: PG, JeSmazan: false, ZavadaList: [{ GuidId: zg, ObjektCastGuidId: p.guid, JeSmazan: undefined, Popis: html(d.popis),
             StavGuidId: undefined, PouzitelnostGuidId: undefined, Priorita: undefined, PrilohaList: pril, OdpojitPrilohyList: [], OpatreniList: op }] });
+          recAdd('zavady', zg);
           log(`✓ závada ${d.id || d._i + 1} (${p.code})${op.length ? ', opatření ' + op.length : ''}${pril.length ? ', foto ' + pril.length : ''}`);
         } catch (e) { errs.push(`závada ${d.id}: ${e.message}`); log(`✗ závada ${d.id || d._i + 1}: ${e.message}`, 'e'); }
       }
     } catch (e) { errs.push(e.message); log('✗ ' + e.message, 'e'); }
     logEl.insertAdjacentHTML('beforeend', `<div style="margin-top:8px"><b>${errs.length ? 'Hotovo s chybami: ' + errs.length : 'Hotovo.'}</b> Obnov stránku (F5) a zkontroluj prohlídku v ${SYS.n}.</div>
+      <div class="row"><button class="p" id="pvy-r">Obnovit stránku</button></div>`);
+    ui.querySelector('#pvy-r').onclick = () => location.reload();
+  }
+
+  /* ---------- smazání vložených údajů ---------- */
+  // stejná volání jako koše na stránce: část (i se závadami), závada (i s opatřeními), příloha
+  const txt = h => String(h || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  async function stepDel() {
+    say('Načítám obsah prohlídky…');
+    let DD; try { DD = await detail(); } catch (e) { say('Chyba: ' + esc(e.message), 'e'); return; }
+    if (!/není dokon|neni dokon|nedokon/i.test(String((DD.ZakladniUdaje || {}).Dokonceni || ''))) { say('Prohlídka už není rozpracovaná – mazat nelze.', 'e'); return; }
+    const R = rec(), RR = DD.RozsireneUdaje || {};
+    const casti = (RR.ObjektCastList || []).filter(c => !c.JeSmazan), pril = (RR.PrilohaList || []).filter(a => !a.JeSmazan);
+    const tag = ok => ok ? ' <span class="m">(vloženo záložkou)</span>' : '';
+    const rows = casti.map((c, i) => {
+      const zs = (c.ZavadaList || []).filter(z => !z.JeSmazan);
+      return `<tr><td><input type="checkbox" class="pvd-c" data-i="${i}" ${R.casti.includes(c.GuidId) ? 'checked' : ''}></td>
+        <td><b>${esc(c.CastObjektuNazev)}</b>${c.PoziceText ? ' – ' + esc(c.PoziceText) : ''}${tag(R.casti.includes(c.GuidId))}
+        <div class="m">smaže i všech ${zs.length} závad této části</div>
+        ${zs.map((z, k) => `<label style="margin-left:14px"><input type="checkbox" class="pvd-z" data-i="${i}" data-k="${k}" ${R.zavady.includes(z.GuidId) ? 'checked' : ''}>
+          závada: ${esc(txt(z.Popis).slice(0, 110))}${(z.OpatreniList || []).length ? ` <span class="m">+ ${(z.OpatreniList || []).length} opatření</span>` : ''}${tag(R.zavady.includes(z.GuidId))}</label>`).join('')}</td></tr>`;
+    }).join('');
+    const prow = pril.map((a, i) => `<tr><td><input type="checkbox" class="pvd-p" data-i="${i}" ${R.prilohy.includes(a.GuidId) ? 'checked' : ''}></td>
+      <td>${a.Poradi}. ${esc(a.Soubor)} <span class="m">${esc(txt(a.Popis).slice(0, 80))}${(a.ZavadaGuidIdList || []).length ? ' · připojena k závadě' : ''}</span>${tag(R.prilohy.includes(a.GuidId))}</td></tr>`).join('');
+    say(`<div class="m">Předvybrané jsou položky, které do této prohlídky vložila záložka v tomto prohlížeči${R.kdy ? ' (naposledy ' + esc(new Date(R.kdy).toLocaleString('cs-CZ')) + ')' : ''}. Ostatní lze zaškrtnout ručně.</div>
+      <h4>Části a závady (${casti.length})</h4>${rows ? `<table>${rows}</table>` : '<div class="m">žádné</div>'}
+      <h4>Fotografie a dokumenty (${pril.length})</h4>${prow ? `<table>${prow}</table>` : '<div class="m">žádné</div>'}
+      <div class="m" style="margin-top:8px">Základní údaje a rozhodnutí se nemažou. Prohlídka se nedokončuje ani neschvaluje.</div>
+      <div class="row"><button id="pvd-back">Zpět</button><button class="p" id="pvd-go">Smazat vybrané</button></div>`);
+    // zaškrtnutá část = i všechny její závady
+    ui.querySelectorAll('.pvd-c').forEach(c => c.onchange = () => ui.querySelectorAll(`.pvd-z[data-i="${c.dataset.i}"]`).forEach(z => { if (c.checked) z.checked = true; z.disabled = c.checked; }));
+    ui.querySelectorAll('.pvd-c:checked').forEach(c => c.onchange());
+    ui.querySelector('#pvd-back').onclick = step1;
+    ui.querySelector('#pvd-go').onclick = () => {
+      const sc = [...ui.querySelectorAll('.pvd-c:checked')].map(c => casti[+c.dataset.i]);
+      const sz = [...ui.querySelectorAll('.pvd-z:checked:not(:disabled)')].map(z => (casti[+z.dataset.i].ZavadaList || []).filter(x => !x.JeSmazan)[+z.dataset.k]);
+      const sp = [...ui.querySelectorAll('.pvd-p:checked')].map(p => pril[+p.dataset.i]);
+      if (!sc.length && !sz.length && !sp.length) return alert('Nic není vybráno.');
+      const row = ui.querySelector('#pvd-go').parentNode;
+      row.innerHTML = `<div style="flex:1" class="e">Trvale smazat v ${SYS.n}: části ${sc.length} (i s jejich závadami), další závady ${sz.length}, přílohy ${sp.length}? Vrátit to nejde.</div>
+        <button id="pvd-no">Ne</button><button class="p" id="pvd-yes" style="background:#b3261e;border-color:#b3261e">Ano, smazat</button>`;
+      row.querySelector('#pvd-no').onclick = stepDel;
+      row.querySelector('#pvd-yes').onclick = () => doDel(sc, sz, sp);
+    };
+  }
+  async function doDel(sc, sz, sp) {
+    say('<div id="pvy-log"></div>');
+    const logEl = ui.querySelector('#pvy-log'), lines = [], log = (t, cls = '') => { lines.push(`<div class="${cls}">${esc(t)}</div>`); logEl.innerHTML = lines.join(''); };
+    let err = 0;
+    const R = rec(), forget = (k, g) => { R[k] = R[k].filter(x => x !== g); };
+    const run = async (t, body) => { try { await upd(body, true); log('✓ ' + t); return true; } catch (e) { err++; log('✗ ' + t + ': ' + e.message, 'e'); return false; } };
+    for (const z of sz) if (await run('závada ' + txt(z.Popis).slice(0, 60), { GuidId: PG, JeSmazan: false, ZavadaList: [{ ...z, JeSmazan: true }] })) forget('zavady', z.GuidId);
+    for (const c of sc) if (await run('část ' + c.CastObjektuNazev, { GuidId: PG, ObjektCastList: [{ GuidId: c.GuidId, JeSmazan: true }], ZavadaList: c.ZavadaList })) {
+      forget('casti', c.GuidId); (c.ZavadaList || []).forEach(z => forget('zavady', z.GuidId)); }
+    for (const a of sp) if (await run('příloha ' + a.Soubor, { GuidId: PG, PrilohaList: [{ GuidId: a.GuidId, JeSmazan: true }] })) forget('prilohy', a.GuidId);
+    try { localStorage.setItem(RK, JSON.stringify(R)); } catch (e) { }
+    logEl.insertAdjacentHTML('beforeend', `<div style="margin-top:8px"><b>${err ? 'Hotovo s chybami: ' + err : 'Hotovo.'}</b> Obnov stránku (F5).</div>
       <div class="row"><button class="p" id="pvy-r">Obnovit stránku</button></div>`);
     ui.querySelector('#pvy-r').onclick = () => location.reload();
   }
